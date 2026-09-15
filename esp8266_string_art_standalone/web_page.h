@@ -1,343 +1,31 @@
-/*
-  ESP8266 String Art Indexer
-  ==========================
-  Drives a 28BYJ-48 stepper (via a ULN2003 driver board) that rotates a
-  disc of nails. The motor's job is purely to index: bring the next nail
-  in the sequence to a fixed pointer on the frame so you can wrap the
-  thread by hand, then advance to the next one.
-
-  Control is via a small web page served over WiFi (works from a phone
-  on the same network) showing the current/next nail and Next/Prev/Auto
-  buttons. Upload the sequence.txt produced by string_art_generator.py
-  from that same page.
-
-  Two optional extras, both non-blocking like everything else here:
-    - FEEDER_SERVO (SG90): a small servo that nudges/releases a bit of
-      thread on each nail advance. It can fire automatically after every
-      "next" step (toggle "Auto-feed" in Settings) or on demand via the
-      "Feed now" button. Rest/feed angle and pulse length are adjustable.
-    - LIMIT_SWITCH: a lever/microswitch mounted on the frame so the
-      rotating disc trips it once per revolution at the physical nail-0
-      mark. "Find Home" slowly rotates the disc until the switch trips,
-      then declares that the true nail 0 -- a physically-verified
-      alternative to "Set Home" (which just relabels wherever the disc
-      currently sits, without checking anything).
-
-  ----------------------------------------------------------------------
-  CHANGES IN THIS REVISION
-    1. Rotation direction. The nails ride on the disc and the feeder is
-       fixed, so to present nail N the disc must turn BACKWARDS by N.
-       The old code turned forwards, so nail (numNails - N) arrived
-       instead -- 258 showed up as 102, 109 as 251, 263 as 97.
-       Fixed by dirSign, which now defaults to -1 and is toggleable
-       from the web UI without reflashing.
-    2. Steps per revolution. 4096 was an approximation; the true figure
-       is 4075.77 (gear ratio 63.68395:1, not 64:1). 4096 drifts about
-       1.8 deg per revolution. The nail->step maths now uses the exact
-       value in integer arithmetic.
-    3. Position tracking. currentStep is normalized to one revolution
-       when each move finishes, so rounding cannot accumulate over
-       thousands of chords, and the saved state file stays small.
-    4. A "Run direction test" button in machine settings: the disc
-       visits nail 0, 1/4, 1/2, 3/4 and back, naming each one as it
-       goes so you can check the nail at the feeder matches.
-
-  ----------------------------------------------------------------------
-  WIRING (see the project guide for the full diagram):
-    ULN2003 IN1 -> ESP8266 D1 (GPIO5)
-    ULN2003 IN2 -> ESP8266 D2 (GPIO4)
-    ULN2003 IN3 -> ESP8266 D5 (GPIO14)
-    ULN2003 IN4 -> ESP8266 D6 (GPIO12)
-    ULN2003 GND -> ESP8266 GND (common ground, required)
-    ULN2003 "+" -> external 5V supply (do NOT power the motor from the
-                   ESP8266's own 5V/3V3 regulator; share ground only)
-
-    SG90 signal -> ESP8266 D3 (GPIO0)
-    SG90 V+     -> external 5V supply (an SG90 can spike well past what
-                   the ESP8266's onboard regulator can supply alongside
-                   WiFi -- share the same external supply and GND as the
-                   ULN2003, not the ESP8266's own 5V/3V3 pins)
-    SG90 GND    -> common ground (same net as everything else above)
-
-    LIMIT_SWITCH -> one leg to ESP8266 D7 (GPIO13), the other leg to GND
-                    (the internal pull-up is enabled in firmware, so the
-                    switch just needs to short the pin to GND when
-                    triggered -- no external resistor needed)
-
-    D3/GPIO0 and D7/GPIO13 are deliberately NOT the same pins used for
-    the stepper (D1/D2/D5/D6). D7 has no boot-time role at all, so it's
-    safe for an input that might be held closed at power-on. D3 does have
-    a boot-time role (must read HIGH at reset), but that only matters for
-    an INPUT; as an OUTPUT driving a servo, nothing pulls it low before
-    the sketch starts, so it boots normally.
-
-  Before flashing:
-    1. Set WIFI_SSID / WIFI_PASSWORD below.
-    2. Board Manager: install "esp8266" by ESP8266 Community.
-    3. Tools > Board: e.g. "NodeMCU 1.0 (ESP-12E Module)".
-    4. Tools > Flash Size: pick one with an SPIFFS/LittleFS partition.
-    5. Library Manager: no extra libraries needed beyond the ESP8266 core
-       (ESP8266WiFi, ESP8266WebServer, LittleFS are all bundled with it).
-  ----------------------------------------------------------------------
-*/
-
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
-#include <LittleFS.h>
-#include <Servo.h>
-#include <vector>
-
-// ---------------- User configuration ----------------
-const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char *AP_FALLBACK_SSID = "StringArtCNC";
-const char *AP_FALLBACK_PASSWORD = ""; // used only if STA connect fails
-const char *HOSTNAME = "stringart";
-
-// Stepper / driver pins (avoid D0/D3/D4/D8: boot-strapping pins)
-const uint8_t PIN_IN1 = 5;  // D1
-const uint8_t PIN_IN2 = 4;  // D2
-const uint8_t PIN_IN3 = 14; // D5
-const uint8_t PIN_IN4 = 12; // D6
-
-// Feeder servo (SG90) and home limit switch -- see the wiring notes above
-// for why these two specific pins were picked among the remaining ones.
-const uint8_t PIN_FEEDER_SERVO = 0;  // D3
-const uint8_t PIN_LIMIT_SWITCH = 13; // D7
-
-// 28BYJ-48 via ULN2003, half-step mode.
+// =============================================================================
+//  web_page.h -- the machine's web UI, as one PROGMEM string
+// =============================================================================
 //
-// The commonly quoted 4096 half-steps/rev assumes a 64:1 gearbox. The real
-// gear ratio is 63.68395:1, so one output revolution is 64 * 63.68395 =
-// 4075.77 half-steps. Using 4096 puts every nail about 0.5% too far round,
-// which is ~1.8 deg of error by the time you get back to nail 0 -- enough to
-// visibly smear the last chords of a long sequence. We keep the exact value
-// scaled by 100 and do the nail->step maths in integers.
-const long STEPS_PER_REV      = 4076;    // rounded, used for wrapping
-const long STEPS_PER_REV_X100 = 407577L; // 4075.77 * 100, used for the maths
-
-// Which way the disc turns to present a nail to the fixed feeder.
+//  WHY THIS IS A SEPARATE FILE
 //
-// The nails ride on the disc and the feeder does not move, so to bring nail N
-// to the feeder the disc must rotate BACKWARDS by N -- nail N starts N steps
-// ahead of the feeder and has to travel back. Turning forwards instead
-// presents nail (numNails - N): ask for 258 and 102 shows up.
+//  The Arduino build does not compile your .ino directly. It preprocesses it
+//  first: concatenating files, inserting #include <Arduino.h>, scanning for
+//  function definitions and injecting generated prototypes. That scanner does
+//  not reliably understand C++11 raw string literals, and on a literal this
+//  large it can cut the string short -- after which the browser code inside it
+//  gets handed to the C++ compiler, which reports something like:
 //
-//   -1 = disc turns opposite to the nail numbering  (the correct default)
-//   +1 = disc turns with the nail numbering
+//      expected constructor, destructor, or type conversion before '(' token
 //
-// Toggle it live from the web UI ("Reverse rotation direction") -- no reflash
-// needed. Re-home after changing it.
-int8_t dirSign = -1;
+//  pointing at a line of minified JavaScript.
+//
+//  Arduino does NOT preprocess .h files. Moving the page here takes it out of
+//  reach of that step entirely. Keep it in this file; do not paste it back
+//  into the .ino.
+//
+//  This is still one sketch. Put web_page.h next to the .ino in the same
+//  folder and it compiles and flashes as a single click, exactly as before.
+// =============================================================================
 
-uint16_t stepDelayMs = 2;    // delay between half-steps; lower = faster but can stall
-uint16_t numNails = 360;     // must match --nails used in the generator
-uint32_t autoAdvanceMs = 4000; // used only in "auto" run mode
+#pragma once
+#include <Arduino.h>
 
-// Feeder servo settings (persisted -- see save/loadConfig)
-uint8_t feederRestAngle = 0;
-uint8_t feederFeedAngle = 90;
-uint16_t feederPulseMs = 300;   // how long it dwells at feederFeedAngle before returning
-bool feederAutoFeed = false;    // fire a pulse automatically after every "next" advance
-
-// ---------------- Persistent files ----------------
-const char *SEQ_FILE = "/sequence.csv";
-const char *STATE_FILE = "/state.txt";
-const char *CONFIG_FILE = "/config.txt";
-
-// ---------------- Runtime state ----------------
-ESP8266WebServer server(80);
-std::vector<uint16_t> sequence;
-int currentIndex = 0;        // index into `sequence` of the nail we're currently AT
-long currentStep = 0;        // absolute half-step position of the disc
-long targetStep = 0;
-bool stepping = false;
-int8_t stepDir = 1;
-uint8_t halfStepIdx = 0;
-unsigned long lastStepAt = 0;
-bool autoRunning = false;
-unsigned long lastAutoAdvanceAt = 0;
-
-// Feeder servo (non-blocking: fire-and-return via millis(), like the stepper)
-Servo feederServo;
-bool feederActive = false;           // mid-pulse, waiting to return to rest
-unsigned long feederReturnAt = 0;
-bool feederPendingAfterMove = false; // fire once the in-flight stepper move completes
-
-// Homing (non-blocking seek toward the limit switch)
-bool homing = false;
-bool homeError = false;      // set if the switch never triggered within the safety cap
-int8_t homeDir = 1;
-long homeStepCount = 0;
-long homeStartStep = 0;      // restored on abort so the position tracker isn't corrupted
-const long HOME_STEP_CAP = STEPS_PER_REV + STEPS_PER_REV / 4; // 1.25 rev safety limit
-
-// Half-step sequence for a ULN2003-driven unipolar stepper (IN1..IN4)
-const uint8_t HALF_STEP_SEQ[8][4] = {
-    {1, 0, 0, 0},
-    {1, 1, 0, 0},
-    {0, 1, 0, 0},
-    {0, 1, 1, 0},
-    {0, 0, 1, 0},
-    {0, 0, 1, 1},
-    {0, 0, 0, 1},
-    {1, 0, 0, 1},
-};
-
-void writeCoils(uint8_t idx) {
-  digitalWrite(PIN_IN1, HALF_STEP_SEQ[idx][0]);
-  digitalWrite(PIN_IN2, HALF_STEP_SEQ[idx][1]);
-  digitalWrite(PIN_IN3, HALF_STEP_SEQ[idx][2]);
-  digitalWrite(PIN_IN4, HALF_STEP_SEQ[idx][3]);
-}
-
-void coilsOff() {
-  digitalWrite(PIN_IN1, LOW);
-  digitalWrite(PIN_IN2, LOW);
-  digitalWrite(PIN_IN3, LOW);
-  digitalWrite(PIN_IN4, LOW);
-}
-
-long normalizeStep(long s) {
-  s %= STEPS_PER_REV;
-  if (s < 0) s += STEPS_PER_REV;
-  return s;
-}
-
-// Begin a (non-blocking) move to an absolute step position, shortest direction.
-void beginMoveToStep(long target) {
-  target = normalizeStep(target);
-  long delta = target - currentStep;
-  // wrap into (-STEPS_PER_REV/2, STEPS_PER_REV/2]
-  while (delta > STEPS_PER_REV / 2) delta -= STEPS_PER_REV;
-  while (delta <= -STEPS_PER_REV / 2) delta += STEPS_PER_REV;
-  targetStep = currentStep + delta;
-  stepDir = (delta >= 0) ? 1 : -1;
-  stepping = (delta != 0);
-}
-
-// Absolute disc position (in half-steps) that puts `nail` at the feeder.
-// Rounded to the nearest half-step, signed by dirSign, wrapped to one rev.
-long nailToStep(uint16_t nail) {
-  if (numNails == 0) return 0;
-  long n = ((long)nail % (long)numNails + (long)numNails) % (long)numNails;
-  long s = (n * STEPS_PER_REV_X100 + (long)numNails * 50L) / ((long)numNails * 100L);
-  return normalizeStep((long)dirSign * s);
-}
-
-// ---- Feeder servo (non-blocking pulse: move to feed angle, return later) --
-void startFeederPulse() {
-  feederServo.write(feederFeedAngle);
-  feederActive = true;
-  feederReturnAt = millis() + feederPulseMs;
-}
-
-// ---- Homing (non-blocking seek toward the limit switch) -------------------
-void startHoming(int8_t dir) {
-  homing = true;
-  homeError = false;
-  homeDir = dir;
-  homeStepCount = 0;
-  homeStartStep = currentStep;
-  stepping = false; // cancel any queued sequence move -- homing takes priority
-  lastStepAt = millis();
-}
-
-void saveState() {
-  File f = LittleFS.open(STATE_FILE, "w");
-  if (!f) return;
-  f.printf("%d\n%ld\n", currentIndex, currentStep);
-  f.close();
-}
-
-void loadState() {
-  File f = LittleFS.open(STATE_FILE, "r");
-  if (!f) return;
-  currentIndex = f.readStringUntil('\n').toInt();
-  // normalize: a state file written by older firmware used 4096 steps/rev and
-  // could hold an unbounded step count
-  currentStep = normalizeStep(f.readStringUntil('\n').toInt());
-  f.close();
-}
-
-void saveConfig() {
-  File f = LittleFS.open(CONFIG_FILE, "w");
-  if (!f) return;
-  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n",
-           numNails, stepDelayMs, (unsigned long)autoAdvanceMs,
-           feederRestAngle, feederFeedAngle, feederPulseMs, feederAutoFeed ? 1u : 0u,
-           (int)dirSign);
-  f.close();
-}
-
-// Reads one line and returns `def` (instead of 0) when the line is missing
-// or empty, so loading a config file written by an older firmware version
-// (fewer lines -- no feeder fields yet) leaves the new fields at whatever
-// sane default the caller passes, rather than stomping them to 0.
-long readConfigLine(File &f, long def) {
-  if (!f.available()) return def;
-  String line = f.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) return def;
-  return line.toInt();
-}
-
-void loadConfig() {
-  File f = LittleFS.open(CONFIG_FILE, "r");
-  if (!f) return;
-  numNails = (uint16_t)readConfigLine(f, numNails);
-  stepDelayMs = (uint16_t)readConfigLine(f, stepDelayMs);
-  autoAdvanceMs = (uint32_t)readConfigLine(f, autoAdvanceMs);
-  feederRestAngle = (uint8_t)readConfigLine(f, feederRestAngle);
-  feederFeedAngle = (uint8_t)readConfigLine(f, feederFeedAngle);
-  feederPulseMs = (uint16_t)readConfigLine(f, feederPulseMs);
-  feederAutoFeed = readConfigLine(f, feederAutoFeed ? 1 : 0) != 0;
-  dirSign = (readConfigLine(f, dirSign) < 0) ? -1 : 1;
-  f.close();
-  if (numNails == 0) numNails = 200;
-  if (stepDelayMs == 0) stepDelayMs = 2;
-  if (autoAdvanceMs == 0) autoAdvanceMs = 4000;
-}
-
-void loadSequenceFromFile() {
-  sequence.clear();
-  File f = LittleFS.open(SEQ_FILE, "r");
-  if (!f) return;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-    sequence.push_back((uint16_t)line.toInt());
-  }
-  f.close();
-}
-
-// Parse an uploaded body of comma/newline/space separated integers into the
-// sequence vector and persist it to LittleFS.
-void parseAndSaveSequence(const String &body) {
-  sequence.clear();
-  int start = 0;
-  int len = body.length();
-  while (start < len) {
-    while (start < len && !isDigit(body[start])) start++;
-    int end = start;
-    while (end < len && isDigit(body[end])) end++;
-    if (end > start) {
-      sequence.push_back((uint16_t)body.substring(start, end).toInt());
-    }
-    start = end;
-  }
-  File f = LittleFS.open(SEQ_FILE, "w");
-  if (f) {
-    for (uint16_t n : sequence) f.printf("%u\n", n);
-    f.close();
-  }
-  currentIndex = 0;
-  saveState();
-}
-
-// ---------------- Web UI ----------------
 const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
 <!DOCTYPE html>
 <html lang="en">
@@ -513,6 +201,22 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   details summary{ cursor:pointer; font-size:.82rem; color:var(--text-dim); font-weight:600; margin-bottom:10px; }
   details .field{ margin-bottom:10px; }
 
+  /* Base template designer */
+  .sync-box{
+    font-family:"IBM Plex Mono",monospace; font-size:.75rem; line-height:1.6;
+    border:1px solid var(--border); border-left-width:3px; border-radius:7px;
+    padding:9px 11px; margin-bottom:10px; background:var(--bg);
+  }
+  .sync-box.exact{ border-left-color:var(--good); }
+  .sync-box.approx{ border-left-color:var(--warn); }
+  .sync-box b{ color:var(--text); }
+  .sync-box .dim{ color:var(--text-dim); }
+  #basePreview{
+    background:#fff; border:1px solid var(--border); border-radius:10px;
+    padding:8px; margin-bottom:10px; overflow:hidden;
+  }
+  #basePreview svg{ display:block; width:100%; height:auto; }
+
   /* Crop modal */
   #cropOverlay{
     position:fixed; inset:0; background:rgba(10,8,4,.6); display:flex; align-items:center; justify-content:center;
@@ -544,7 +248,7 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
 <body>
 
 <div class="topbar">
-  <span class="eyebrow">wooduloveit.com &amp; Thread</span>
+  <span class="eyebrow">Nail &amp; thread</span>
   <h1>String Art Studio</h1>
 </div>
 
@@ -568,16 +272,17 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     </div>
 
     <div class="field">
-      <label for="numPins">Pins <span class="val" id="numPinsVal">360</span></label>
-      <input type="range" id="numPins" min="60" max="400" step="4" value="360">
+      <label for="numPins">Nails <span class="val" id="numPinsVal">200</span></label>
+      <input type="range" id="numPins" min="24" max="720" step="1" value="200">
+      <div class="stat-line">Shared with the base template and the machine.</div>
     </div>
     <div class="field">
       <label for="numChords">Chords <span class="val" id="numChordsVal">3000</span></label>
       <input type="range" id="numChords" min="200" max="8000" step="50" value="3000">
     </div>
     <div class="field">
-      <label for="lineWeight">Line weight <span class="val" id="lineWeightVal">22</span></label>
-      <input type="range" id="lineWeight" min="4" max="60" step="1" value="22">
+      <label for="lineWeight">Line weight <span class="val" id="lineWeightVal">18</span></label>
+      <input type="range" id="lineWeight" min="4" max="60" step="1" value="18">
     </div>
 
     <button class="primary" id="generateBtn" disabled>Generate string art</button>
@@ -613,36 +318,14 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     <div class="idx-sub" id="idxSwitchText">limit switch: &mdash;</div>
 
     <details>
-      <summary>Jump to nail # / machine settings</summary>
+      <summary>Jump to a nail</summary>
       <div class="field">
-        <label>Jump motor to nail # (doesn't change progress)</label>
+        <label>Jump motor to nail # <span class="val">no progress change</span></label>
         <div class="btn-pair">
           <input id="idxGotoVal" type="number" min="0">
           <button class="ghost" id="idxGotoBtn" style="width:auto;flex:none;padding:8px 16px">Go</button>
         </div>
       </div>
-      <div class="field">
-        <label>Number of nails</label>
-        <input id="idxNumNails" type="number">
-      </div>
-      <div class="field">
-        <label>Step delay (ms/half-step)</label>
-        <input id="idxStepDelay" type="number">
-      </div>
-      <div class="field">
-        <label>Auto-advance interval (ms)</label>
-        <input id="idxAutoMs" type="number">
-      </div>
-      <div class="switch-row">
-        <span>Reverse rotation direction</span>
-        <label class="switch"><input type="checkbox" id="idxReverseDir"><span class="slider"></span></label>
-      </div>
-      <div class="idx-sub" style="margin-top:0;text-align:left">
-        Leave this on unless the test below says otherwise. Re-home after changing it.
-      </div>
-      <button class="ghost" id="idxDirTestBtn">Run direction test</button>
-      <div class="idx-sub" id="idxDirTestText" style="text-align:left">&nbsp;</div>
-      <button class="secondary" id="idxSaveConfigBtn">Save machine settings</button>
     </details>
 
     <hr>
@@ -653,22 +336,128 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       <label class="switch"><input type="checkbox" id="feederAutoFeed"><span class="slider"></span></label>
     </div>
     <button class="primary" id="feederFeedBtn">Feed now</button>
+    <div class="stat-line" id="feederCycleText">&mdash;</div>
+
+    <hr>
+
+    <p class="section-title">4 &middot; Base template</p>
+    <p class="idx-sub" style="text-align:left;margin-bottom:12px">
+      Print this once, glue it to the board, drill a nail at every red dot.
+      The numbering matches what the generator and the indexer expect.
+    </p>
+
+    <div class="field">
+      <label>Nails <span class="val" id="baseCountSaved">&mdash;</span></label>
+      <input id="baseCount" type="number" min="24" max="720" step="1" value="200">
+    </div>
+    <div class="field">
+      <label>Ring radius <span class="val">mm</span></label>
+      <input id="baseRadius" type="number" min="10" step="0.5" value="200">
+    </div>
+
+    <div id="baseSync" class="sync-box">&mdash;</div>
+    <div class="btn-pair" id="baseSuggestRow"></div>
+
+    <div id="basePreview"></div>
+
+    <button class="ghost" id="baseOpenBtn">Open full size</button>
+    <button class="primary" id="baseSaveBtn" style="margin-bottom:0">Download SVG template</button>
+
     <details>
-      <summary>Feeder servo (SG90) settings</summary>
+      <summary>Template options</summary>
       <div class="field">
-        <label>Rest angle (&deg;)</label>
+        <label>Label font size <span class="val">px</span></label>
+        <input id="baseFont" type="number" min="1" step="0.5" value="10">
+      </div>
+      <div class="field">
+        <label>Outer margin <span class="val">mm</span></label>
+        <input id="baseMargin" type="number" min="0" step="0.5" value="10">
+      </div>
+      <div class="field">
+        <label>Cut margin <span class="val">mm</span></label>
+        <input id="baseCutMargin" type="number" min="0" step="0.5" value="15">
+      </div>
+      <div class="switch-row">
+        <span>Nail dots</span>
+        <label class="switch"><input type="checkbox" id="baseDots" checked><span class="slider"></span></label>
+      </div>
+      <div class="switch-row">
+        <span>Centre mark</span>
+        <label class="switch"><input type="checkbox" id="baseCentre" checked><span class="slider"></span></label>
+      </div>
+      <div class="switch-row">
+        <span>Laser-cut circle</span>
+        <label class="switch"><input type="checkbox" id="baseCut"><span class="slider"></span></label>
+      </div>
+      <div class="stat-line" id="basePaper">&mdash;</div>
+    </details>
+
+    <hr>
+
+    <p class="section-title">Advanced settings</p>
+    <p class="idx-sub" style="text-align:left;margin-bottom:12px">
+      Everything the machine remembers between reboots. Edits are held until
+      you press Save, so a field you are typing in will not be overwritten by
+      the status poll.
+    </p>
+
+    <details open>
+      <summary>Motor</summary>
+      <div class="field">
+        <label>Nails <span class="val">shared</span></label>
+        <input id="idxNumNails" type="number" min="24" max="720">
+      </div>
+      <div class="field">
+        <label>Step delay <span class="val">ms / half-step</span></label>
+        <input id="idxStepDelay" type="number" min="1" max="50">
+      </div>
+      <div class="switch-row">
+        <span>Reverse rotation direction</span>
+        <label class="switch"><input type="checkbox" id="idxReverseDir"><span class="slider"></span></label>
+      </div>
+      <div class="idx-sub" style="margin-top:0;text-align:left">
+        Leave on unless the test says otherwise. Re-home after changing it.
+      </div>
+      <button class="ghost" id="idxDirTestBtn">Run direction test</button>
+      <div class="idx-sub" id="idxDirTestText" style="text-align:left">&nbsp;</div>
+    </details>
+
+    <details open>
+      <summary>Feed cycle</summary>
+      <div class="field">
+        <label>Settle before feed <span class="val">ms</span></label>
+        <input id="feederSettleMs" type="number" min="0" max="10000" step="50">
+      </div>
+      <div class="field">
+        <label>Pulse duration <span class="val">ms</span></label>
+        <input id="feederPulseMs" type="number" min="0" max="10000" step="50">
+      </div>
+      <div class="field">
+        <label>Recover after feed <span class="val">ms</span></label>
+        <input id="feederRecoverMs" type="number" min="0" max="10000" step="50">
+      </div>
+      <div class="field">
+        <label>Dwell before next nail <span class="val">ms</span></label>
+        <input id="idxAutoMs" type="number" min="0" max="120000" step="100">
+      </div>
+      <div class="sync-box" id="cycleBreakdown">&mdash;</div>
+    </details>
+
+    <details>
+      <summary>Feeder servo (SG90) angles</summary>
+      <div class="field">
+        <label>Rest angle <span class="val">&deg;</span></label>
         <input id="feederRestAngle" type="number" min="0" max="180">
       </div>
       <div class="field">
-        <label>Feed angle (&deg;)</label>
+        <label>Feed angle <span class="val">&deg;</span></label>
         <input id="feederFeedAngle" type="number" min="0" max="180">
       </div>
-      <div class="field">
-        <label>Pulse duration (ms)</label>
-        <input id="feederPulseMs" type="number" min="0">
-      </div>
-      <button class="secondary" id="feederSaveBtn">Save feeder settings</button>
     </details>
+
+    <div class="msg" id="advMsg"></div>
+    <button class="primary" id="advSaveBtn">Save advanced settings</button>
+    <button class="ghost" id="advResetBtn">Restore defaults</button>
   </div>
 </div>
 
@@ -683,6 +472,63 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   </div>
 </div>
 
+<script>
+/* ---- Shared nail count -------------------------------------------------
+   One number, three views: the Design slider, the Base template input, and
+   the machine settings field. Editing any of them updates the others
+   immediately and saves to the machine once typing stops, so the printed
+   base, the generated sequence and the indexer can never disagree.       */
+window.NailCount = (function(){
+  "use strict";
+  const MIN = 24, MAX = 720, SAVE_DELAY_MS = 600;
+  let value = 200;
+  let unsaved = false;      // a local edit not yet written to the machine
+  let saveTimer = null;
+  const subs = [];
+
+  const clamp = v => Math.min(MAX, Math.max(MIN, Math.round(+v) || MIN));
+  const notify = src => subs.forEach(fn => { try { fn(value, src); } catch (e) {} });
+
+  async function save(){
+    const wanted = value;
+    try {
+      await fetch("/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "numNails=" + wanted,
+      });
+    } catch (e) { /* offline: the views stay in sync, the machine catches up later */ }
+    // Cleared either way. Leaving it set would block the status poll from ever
+    // correcting the page again.
+    if (value === wanted) { unsaved = false; notify("saved"); }
+  }
+
+  return {
+    get: () => value,
+    isUnsaved: () => unsaved,
+    // An edit made in the browser, from whichever control.
+    set(v, src){
+      v = clamp(v);
+      if (v === value) return;
+      value = v;
+      unsaved = true;
+      notify(src || "local");
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(save, SAVE_DELAY_MS);
+    },
+    // A value read back from /status. Ignored while an edit is still pending,
+    // so a poll landing mid-keystroke cannot yank the field back.
+    adopt(v){
+      if (unsaved) return;
+      v = clamp(v);
+      if (v === value) return;
+      value = v;
+      notify("machine");
+    },
+    on(fn){ subs.push(fn); fn(value, "init"); },
+  };
+})();
+</script>
 <script>
 /* ---- vendored cropper.min.js ---- */
 /*!
@@ -943,10 +789,19 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   let cropper = null;
   let generating = false;
 
-  ["numPins", "numChords", "lineWeight"].forEach((id) => {
+  ["numChords", "lineWeight"].forEach((id) => {
     const el = document.getElementById(id);
     const out = document.getElementById(id + "Val");
     el.addEventListener("input", () => { out.textContent = el.value; });
+  });
+
+  // Nail count is shared, so this slider both reads and writes NailCount
+  // rather than owning a value of its own.
+  const numPinsVal = document.getElementById("numPinsVal");
+  numPinsInput.addEventListener("input", () => NailCount.set(numPinsInput.value, "design"));
+  NailCount.on((v, src) => {
+    numPinsVal.textContent = v;
+    if (src !== "design") numPinsInput.value = v;
   });
 
   function bg() { return darkModeToggle.checked ? "#262626" : "#ffffff"; }
@@ -1029,7 +884,7 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     downloadSvgBtn.disabled = true;
     sendBtn.disabled = true;
 
-    const numPins = parseInt(numPinsInput.value, 10);
+    const numPins = NailCount.get();
     const numChords = parseInt(numChordsInput.value, 10);
     const weight = parseFloat(lineWeightInput.value);
     const mode = darkModeToggle.checked ? "dark" : "light";
@@ -1166,8 +1021,65 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   const feederRestAngle = document.getElementById("feederRestAngle");
   const feederFeedAngle = document.getElementById("feederFeedAngle");
   const feederPulseMs = document.getElementById("feederPulseMs");
-  const feederSaveBtn = document.getElementById("feederSaveBtn");
+  const feederSettleMs = document.getElementById("feederSettleMs");
+  const feederRecoverMs = document.getElementById("feederRecoverMs");
+  const feederCycleText = document.getElementById("feederCycleText");
+  const cycleBreakdown = document.getElementById("cycleBreakdown");
+  const advSaveBtn = document.getElementById("advSaveBtn");
+  const advResetBtn = document.getElementById("advResetBtn");
+  const advMsg = document.getElementById("advMsg");
   let idxAutoOn = false;
+
+  // ---- Edit guard ------------------------------------------------------
+  // /status is polled once a second. Writing every reply straight into the
+  // inputs meant a field you were halfway through typing got reset under your
+  // fingers -- which is why a longer settle time appeared not to take effect.
+  // A field goes "dirty" on first keystroke and is left alone until it is
+  // saved or the panel is reset.
+  const advFields = [idxNumNails, idxStepDelay, idxAutoMs, feederRestAngle,
+                     feederFeedAngle, feederPulseMs, feederSettleMs, feederRecoverMs];
+  const dirty = new Set();
+  advFields.forEach(f => f.addEventListener("input", () => {
+    dirty.add(f.id);
+    advSaveBtn.textContent = "Save advanced settings *";
+    updateCycleBreakdown();
+  }));
+  function clearDirty(){
+    dirty.clear();
+    advSaveBtn.textContent = "Save advanced settings";
+  }
+  // Only writes the machine's value into a field the user is not editing.
+  function syncField(input, value){
+    if (dirty.has(input.id) || document.activeElement === input) return;
+    if (input.value !== String(value)) input.value = value;
+  }
+  function showAdvMsg(text, ok){
+    advMsg.textContent = text;
+    advMsg.className = "msg show " + (ok ? "ok" : "err");
+    setTimeout(() => { advMsg.className = "msg"; }, 2500);
+  }
+
+  // Reads straight from the inputs so the numbers update as you type, before
+  // anything is saved.
+  function updateCycleBreakdown(){
+    const settle = +feederSettleMs.value || 0;
+    const pulse = +feederPulseMs.value || 0;
+    const recover = +feederRecoverMs.value || 0;
+    const dwell = +idxAutoMs.value || 0;
+    const feed = settle + pulse + recover;
+    cycleBreakdown.className = "sync-box";
+    cycleBreakdown.innerHTML =
+      '<b>' + (settle/1000).toFixed(2) + ' s</b> settle <span class="dim">&rarr;</span> ' +
+      '<b>' + (pulse/1000).toFixed(2) + ' s</b> pulse <span class="dim">&rarr;</span> ' +
+      '<b>' + (recover/1000).toFixed(2) + ' s</b> recover<br>' +
+      '<span class="dim">feed cycle ' + (feed/1000).toFixed(2) + ' s, then ' +
+      (dwell/1000).toFixed(1) + ' s dwell &mdash; ' +
+      ((feed + dwell)/1000).toFixed(2) + ' s per nail plus the move.</span>' +
+      (settle < 300
+        ? '<br><b>Settle under 0.3 s</b> &mdash; the disc is usually still moving.'
+        : '');
+    feederCycleText.textContent = "Feed cycle " + (feed/1000).toFixed(2) + " s per nail.";
+  }
 
   async function refreshIndexer() {
     try {
@@ -1176,11 +1088,13 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       idxNailNum.textContent = j.currentNail;
       idxProgressText.textContent = j.homing
         ? "homing…"
-        : "step " + j.currentIndex + " / " + j.total + "  (next: nail " + j.nextNail + ")";
+        : j.feederBusy
+          ? "feeding thread…"
+          : "step " + j.currentIndex + " / " + j.total + "  (next: nail " + j.nextNail + ")";
       idxBar.value = j.total ? (100 * j.currentIndex / j.total) : 0;
-      idxNumNails.value = j.numNails;
-      idxStepDelay.value = j.stepDelay;
-      idxAutoMs.value = j.autoMs;
+      NailCount.adopt(j.numNails);
+      syncField(idxStepDelay, j.stepDelay);
+      syncField(idxAutoMs, j.autoMs);
       if (document.activeElement !== idxReverseDir) idxReverseDir.checked = (j.dirSign < 0);
       idxAutoOn = j.autoRunning;
       idxAutoBtn.textContent = idxAutoOn ? "Stop Auto" : "Start Auto";
@@ -1188,10 +1102,13 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       idxSwitchText.textContent = "limit switch: " + (j.switchTriggered ? "TRIGGERED" : "open") +
         (j.homing ? "  (homing…)" : "") +
         (j.homeError ? "  — not found last time, check wiring" : "");
-      feederAutoFeed.checked = j.feederAutoFeed;
-      feederRestAngle.value = j.feederRestAngle;
-      feederFeedAngle.value = j.feederFeedAngle;
-      feederPulseMs.value = j.feederPulseMs;
+      if (document.activeElement !== feederAutoFeed) feederAutoFeed.checked = j.feederAutoFeed;
+      syncField(feederRestAngle, j.feederRestAngle);
+      syncField(feederFeedAngle, j.feederFeedAngle);
+      syncField(feederPulseMs, j.feederPulseMs);
+      syncField(feederSettleMs, j.feederSettleMs);
+      syncField(feederRecoverMs, j.feederRecoverMs);
+      updateCycleBreakdown();
     } catch (err) { /* machine momentarily busy mid-step; next poll will catch up */ }
   }
 
@@ -1211,17 +1128,62 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   document.getElementById("idxGotoBtn").addEventListener("click", () => {
     idxAct("goto", document.getElementById("idxGotoVal").value);
   });
-  async function saveMachineConfig() {
-    await fetch("/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "numNails=" + idxNumNails.value + "&stepDelay=" + idxStepDelay.value +
-        "&autoMs=" + idxAutoMs.value + "&dirSign=" + (idxReverseDir.checked ? -1 : 1),
-    });
+  // One save for the whole Advanced panel -- motor, feed cycle and servo
+  // angles go up together, so there is no half-applied state to reason about.
+  async function saveAdvanced() {
+    const body =
+      "numNails=" + NailCount.get() +
+      "&stepDelay=" + idxStepDelay.value +
+      "&autoMs=" + idxAutoMs.value +
+      "&dirSign=" + (idxReverseDir.checked ? -1 : 1) +
+      "&feederRestAngle=" + feederRestAngle.value +
+      "&feederFeedAngle=" + feederFeedAngle.value +
+      "&feederPulseMs=" + feederPulseMs.value +
+      "&feederSettleMs=" + feederSettleMs.value +
+      "&feederRecoverMs=" + feederRecoverMs.value +
+      "&feederAutoFeed=" + (feederAutoFeed.checked ? 1 : 0);
+    try {
+      await fetch("/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+      });
+      clearDirty();
+      showAdvMsg("Saved to the machine.", true);
+    } catch (err) {
+      showAdvMsg("Could not reach the machine.", false);
+      return;
+    }
     refreshIndexer();
   }
-  document.getElementById("idxSaveConfigBtn").addEventListener("click", saveMachineConfig);
-  idxReverseDir.addEventListener("change", saveMachineConfig);
+  advSaveBtn.addEventListener("click", saveAdvanced);
+
+  advResetBtn.addEventListener("click", async () => {
+    try {
+      await fetch("/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "reset=1",
+      });
+      clearDirty();
+      showAdvMsg("Defaults restored.", true);
+    } catch (err) {
+      showAdvMsg("Could not reach the machine.", false);
+      return;
+    }
+    refreshIndexer();
+  });
+
+  // The direction toggle is a switch, not a text field, so it saves at once.
+  idxReverseDir.addEventListener("change", saveAdvanced);
+
+  // Third view of the shared nail count.
+  idxNumNails.addEventListener("input", () => NailCount.set(idxNumNails.value, "machine-settings"));
+  NailCount.on((v, src) => {
+    if (src === "machine-settings") return;
+    idxNumNails.value = v;
+    dirty.delete(idxNumNails.id);   // NailCount saves itself; nothing pending here
+  });
 
   // Sends the disc to nail 0, then a quarter, half and three-quarters of the
   // way round. Watch the feeder: the nail arriving must be the one named.
@@ -1238,269 +1200,270 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     idxDirTestBtn.disabled = false;
   });
 
-  async function saveFeederConfig() {
-    await fetch("/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "feederRestAngle=" + feederRestAngle.value + "&feederFeedAngle=" + feederFeedAngle.value +
-        "&feederPulseMs=" + feederPulseMs.value + "&feederAutoFeed=" + (feederAutoFeed.checked ? 1 : 0),
-    });
-    refreshIndexer();
-  }
-  feederAutoFeed.addEventListener("change", saveFeederConfig);
-  feederSaveBtn.addEventListener("click", saveFeederConfig);
+  feederAutoFeed.addEventListener("change", saveAdvanced);
 
   setInterval(refreshIndexer, 1000);
   refreshIndexer();
   paintBackground();
 })();
 </script>
+<script>
+/* ---- Base template designer -------------------------------------------
+   Draws the printable/laser-cuttable nail ring for the physical base.
+
+   It reads the motor profile from /status rather than hardcoding one, so a
+   template can never be printed for a step count the firmware isn't using.
+   Nail 0 sits at three o'clock and numbering increases clockwise, matching
+   pinPositions() in the generator above and the Python generator, so a nail
+   index means the same physical nail everywhere in the toolchain.
+   Adapted from StringArt-CircleBase-Design by Chanchal Sakarde.            */
+(function(){
+  "use strict";
+  const PX_PER_MM = 96 / 25.4;
+  const mm = v => v * PX_PER_MM;
+  const esc = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const $ = id => document.getElementById(id);
+
+  const el = {
+    count:$("baseCount"), saved:$("baseCountSaved"), radius:$("baseRadius"),
+    font:$("baseFont"), margin:$("baseMargin"), cutMargin:$("baseCutMargin"),
+    dots:$("baseDots"), centre:$("baseCentre"), cut:$("baseCut"),
+    sync:$("baseSync"), suggest:$("baseSuggestRow"), preview:$("basePreview"),
+    paper:$("basePaper"), save:$("baseSaveBtn"), open:$("baseOpenBtn"),
+  };
+
+  // Falls back to the 28BYJ-48 half-step default if the machine is unreachable
+  // (e.g. page saved offline), and says so rather than pretending.
+  let motor = { stepsPerRev:4096, internalSteps:32, halfStep:true, gearRatio:64, live:false };
+
+  const A_SERIES = [["A6",105,148],["A5",148,210],["A4",210,297],["A3",297,420],
+                    ["A2",420,594],["A1",594,841],["A0",841,1189]];
+  const US_SERIES = [["US Letter",215.9,279.4],["US Legal",215.9,355.6],["Tabloid",279.4,431.8],
+                     ["ANSI C",431.8,558.8],["ANSI D",558.8,863.6],["ANSI E",863.6,1117.6]];
+  const fits = (list, side) => list.find(p => Math.min(p[1],p[2]) >= side - 0.05) || null;
+
+  function params(){
+    return {
+      count: NailCount.get(),
+      radiusMM: Math.max(10, +el.radius.value || 10),
+      fontPX: Math.max(1, +el.font.value || 1),
+      marginMM: Math.max(0, +el.margin.value || 0),
+      cutMarginMM: Math.max(0, +el.cutMargin.value || 0),
+    };
+  }
+
+  function geom(p, cutOn){
+    const effMargin = cutOn ? Math.max(p.marginMM, p.cutMarginMM + 2) : p.marginMM;
+    const widthMM = p.radiusMM * 2 + 2 * effMargin;
+    const widthPX = mm(widthMM);
+    return {
+      widthMM, widthPX,
+      cx: widthPX/2, cy: widthPX/2,
+      rPX: mm(p.radiusMM),
+      cutRadiusMM: p.radiusMM + p.cutMarginMM,
+      cutRPX: mm(p.radiusMM + p.cutMarginMM),
+      fontMinor: Math.max(1, p.fontPX - 3),
+    };
+  }
+
+  // Nail 0 at angle 0 (three o'clock); angle grows clockwise because SVG y
+  // points down. Same convention as the chord generator.
+  function ringPoint(g, i, count){
+    const a = 2 * Math.PI * i / count;
+    return { x: g.cx + g.rPX * Math.cos(a), y: g.cy + g.rPX * Math.sin(a), deg: a * 180 / Math.PI };
+  }
+
+  function numbersGroup(p, g){
+    let s = "";
+    for (let i = 0; i < p.count; i++){
+      const q = ringPoint(g, i, p.count);
+      const major = (i % 5 === 0);
+      const label = major ? String(i) : String(i % 10);
+      const fs = major ? p.fontPX : g.fontMinor;
+      s += '<text font-size="' + fs + 'px" transform="rotate(' + q.deg + ',' + q.x + ',' + q.y + ')">' +
+           '<tspan x="' + q.x + '" y="' + q.y + '">-' + esc(label) + '</tspan></text>';
+    }
+    return '<g id="nail-numbers" font-family="Arial, Helvetica, sans-serif" text-anchor="start" ' +
+           'dominant-baseline="middle" fill="#000">' + s + '</g>';
+  }
+
+  function dotsGroup(p, g){
+    const r = mm(0.3);
+    let s = "";
+    for (let i = 0; i < p.count; i++){
+      const q = ringPoint(g, i, p.count);
+      s += '<circle cx="' + q.x + '" cy="' + q.y + '" r="' + r + '"></circle>';
+    }
+    return '<g id="nail-dots" fill="#ff0000" stroke="none">' + s + '</g>';
+  }
+
+  // Drill/pin reference for the exact centre of the board, sized in real mm
+  // so it stays a sensible size whatever the ring radius is.
+  function centreGroup(g){
+    const arm = mm(5), dot = mm(0.5), sw = mm(0.25);
+    return '<g id="centre-mark" stroke="#000" stroke-width="' + sw + '" fill="#000">' +
+      '<line x1="' + (g.cx-arm) + '" y1="' + g.cy + '" x2="' + (g.cx+arm) + '" y2="' + g.cy + '"></line>' +
+      '<line x1="' + g.cx + '" y1="' + (g.cy-arm) + '" x2="' + g.cx + '" y2="' + (g.cy+arm) + '"></line>' +
+      '<circle cx="' + g.cx + '" cy="' + g.cy + '" r="' + dot + '" stroke="none"></circle></g>';
+  }
+
+  // Red stroke is the usual cut-line convention in hobby laser software.
+  function cutGroup(g){
+    return '<g id="cut-circle" fill="none" stroke="#ff0000" stroke-width="' + mm(0.5) + '">' +
+      '<circle cx="' + g.cx + '" cy="' + g.cy + '" r="' + g.cutRPX + '"></circle></g>';
+  }
+
+  function svgMarkup(p, g, cutOn, forExport){
+    const dims = forExport
+      ? 'width="' + g.widthMM + 'mm" height="' + g.widthMM + 'mm"'
+      : 'width="' + g.widthPX + '" height="' + g.widthPX + '"';
+    let body = "";
+    if (!forExport) {
+      body += '<g fill="none" stroke="#dddddd" stroke-width="1"><circle cx="' + g.cx +
+              '" cy="' + g.cy + '" r="' + g.rPX + '"></circle></g>';
+    }
+    if (cutOn) body += cutGroup(g);
+    if (el.centre.checked) body += centreGroup(g);
+    body += numbersGroup(p, g);
+    if (el.dots.checked) body += dotsGroup(p, g);
+    return '<svg xmlns="http://www.w3.org/2000/svg" ' + dims +
+           ' viewBox="0 0 ' + g.widthPX + ' ' + g.widthPX + '">' + body + '</svg>';
+  }
+
+  function divisors(n, lo, hi){
+    const out = [];
+    for (let d = lo; d <= hi; d++) if (n % d === 0) out.push(d);
+    return out;
+  }
+
+  function renderSync(p){
+    const spr = motor.stepsPerRev;
+    const stepDeg = 360 / spr;
+    const perNail = spr / p.count;
+    const exact = Math.abs(perNail - Math.round(perNail)) < 1e-9;
+    const nailDeg = 360 / p.count;
+    const pitchMM = 2 * Math.PI * p.radiusMM / p.count;
+    // Worst case a nail can miss its true angle by half a step, since the
+    // target step is rounded to the nearest whole step.
+    const errDeg = exact ? 0 : 0.5 * stepDeg;
+    const errMM = p.radiusMM * errDeg * Math.PI / 180;
+
+    el.sync.className = "sync-box " + (exact ? "exact" : "approx");
+    let html =
+      '<b>' + motor.internalSteps + '</b> internal steps' +
+      (motor.halfStep ? ' <span class="dim">x2 half-step</span>' : '') +
+      ' <span class="dim">x</span> <b>' + motor.gearRatio.toFixed(motor.gearRatio % 1 ? 5 : 2) + ':1</b>' +
+      ' <span class="dim">=</span> <b>' + (spr % 1 ? spr.toFixed(2) : spr) + '</b> steps/rev' +
+      ' <span class="dim">(' + stepDeg.toFixed(4) + '&deg;/step)</span><br>' +
+      '<b>' + (Math.round(perNail*1000)/1000) + '</b> steps per nail' +
+      ' <span class="dim">&middot; ' + nailDeg.toFixed(3) + '&deg; apart &middot; ' +
+      pitchMM.toFixed(2) + ' mm pitch</span><br>';
+    if (exact) {
+      html += '<span class="dim">Divides evenly &mdash; every nail lands exactly on a step.</span>';
+    } else {
+      html += '<span class="dim">Rounds to the nearest step: up to &plusmn;' + errDeg.toFixed(4) +
+              '&deg; (' + errMM.toFixed(3) + ' mm at this radius).</span>';
+    }
+    if (perNail < 2) {
+      html += '<br><b>Too many nails for this motor</b> &mdash; under 2 steps between ' +
+              'neighbours, the indexer cannot separate them.';
+    } else if (pitchMM < 3) {
+      html += '<br><b>Nails only ' + pitchMM.toFixed(1) + ' mm apart</b> &mdash; ' +
+              'increase the radius or drop the count.';
+    }
+    if (!motor.live) {
+      html += '<br><span class="dim">Machine not reachable &mdash; showing compiled-in defaults.</span>';
+    }
+    el.sync.innerHTML = html;
+
+    // Counts that divide the step grid evenly, filtered to ones you could
+    // actually drill at this radius, nearest to the current value first.
+    const cands = divisors(Math.round(spr), 24, 720)
+      .filter(d => 2 * Math.PI * p.radiusMM / d >= 3)
+      .sort((a,b) => Math.abs(a - p.count) - Math.abs(b - p.count))
+      .slice(0, 3);
+    el.suggest.innerHTML = "";
+    if (!exact && cands.length) {
+      cands.forEach(d => {
+        const b = document.createElement("button");
+        b.className = "ghost";
+        b.textContent = d;
+        b.title = "Exact: " + (spr / d) + " steps per nail";
+        b.addEventListener("click", () => NailCount.set(d, "base"));
+        el.suggest.appendChild(b);
+      });
+    }
+  }
+
+  function render(){
+    const p = params();
+    const cutOn = el.cut.checked;
+    const g = geom(p, cutOn);
+    el.saved.textContent = NailCount.isUnsaved() ? "saving…" : "on machine";
+    el.preview.innerHTML = svgMarkup(p, g, cutOn, false);
+    renderSync(p);
+    const a = fits(A_SERIES, g.widthMM), u = fits(US_SERIES, g.widthMM);
+    el.paper.textContent = (a || u)
+      ? "Prints at 100% on " + [a && a[0], u && u[0]].filter(Boolean).join(" or ") +
+        " (" + g.widthMM.toFixed(0) + " mm square) - turn off 'fit to page'."
+      : "Bigger than A0 / ANSI E (" + g.widthMM.toFixed(0) + " mm square) - tile it or reduce the radius.";
+  }
+
+  function exportSvg(){
+    const p = params();
+    return { text: svgMarkup(p, geom(p, el.cut.checked), el.cut.checked, true), count: p.count };
+  }
+
+  el.save.addEventListener("click", () => {
+    const out = exportSvg();
+    const url = URL.createObjectURL(new Blob([out.text], { type:"image/svg+xml" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "string_art_base_" + out.count + "_nails.svg";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  });
+
+  el.open.addEventListener("click", () => {
+    const url = URL.createObjectURL(new Blob([exportSvg().text], { type:"image/svg+xml" }));
+    window.open(url, "_blank");
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  });
+
+  el.count.addEventListener("input", () => NailCount.set(el.count.value, "base"));
+  el.count.addEventListener("change", () => NailCount.set(el.count.value, "base"));
+  NailCount.on((v, src) => {
+    if (src !== "base") el.count.value = v;
+    render();
+  });
+
+  [el.radius, el.font, el.margin, el.cutMargin].forEach(i => {
+    i.addEventListener("input", render);
+    i.addEventListener("change", render);
+  });
+  [el.dots, el.centre, el.cut].forEach(i => i.addEventListener("change", render));
+
+  // Pull the motor profile and current nail count once at load. The profile is
+  // compile-time constant, so there is nothing to re-poll.
+  (async function init(){
+    try {
+      const j = await (await fetch("/status")).json();
+      if (typeof j.stepsPerRevX100 === "number") {
+        motor = {
+          stepsPerRev: j.stepsPerRevX100 / 100,
+          internalSteps: j.internalSteps,
+          halfStep: !!j.halfStep,
+          gearRatio: j.gearRatioX100000 / 100000,
+          live: true,
+        };
+      }
+      if (j.numNails) NailCount.adopt(j.numNails);
+    } catch (err) { /* offline: keep the defaults and flag it in the readout */ }
+    render();
+  })();
+})();
+</script>
 </body>
 </html>
 
 )STRINGARTPAGE";
-
-// The machine's own page (served from here) is always same-origin, but the
-// browser-based generator (a static page you open separately, or host
-// anywhere on your LAN) is a different origin and needs these headers to be
-// allowed to fetch() this API directly. All requests it makes (text/plain
-// or form-urlencoded, no custom headers) are CORS-simple and shouldn't
-// trigger a preflight, but the OPTIONS routes below handle it if a browser
-// sends one anyway.
-void sendCorsHeaders() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-void handleCorsPreflight() {
-  sendCorsHeaders();
-  server.send(204);
-}
-
-void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
-}
-
-void handleStatus() {
-  uint16_t curNail = sequence.empty() ? 0 : sequence[min((size_t)currentIndex, sequence.size() - 1)];
-  uint16_t nextNail = (sequence.empty() || currentIndex + 1 >= (int)sequence.size())
-                           ? curNail
-                           : sequence[currentIndex + 1];
-  String json = "{";
-  json += "\"currentIndex\":" + String(currentIndex) + ",";
-  json += "\"total\":" + String(sequence.empty() ? 0 : (int)sequence.size() - 1) + ",";
-  json += "\"currentNail\":" + String(curNail) + ",";
-  json += "\"nextNail\":" + String(nextNail) + ",";
-  json += "\"numNails\":" + String(numNails) + ",";
-  json += "\"stepDelay\":" + String(stepDelayMs) + ",";
-  json += "\"autoMs\":" + String(autoAdvanceMs) + ",";
-  json += "\"autoRunning\":" + String(autoRunning ? "true" : "false") + ",";
-  json += "\"feederRestAngle\":" + String(feederRestAngle) + ",";
-  json += "\"feederFeedAngle\":" + String(feederFeedAngle) + ",";
-  json += "\"feederPulseMs\":" + String(feederPulseMs) + ",";
-  json += "\"feederAutoFeed\":" + String(feederAutoFeed ? "true" : "false") + ",";
-  json += "\"dirSign\":" + String((int)dirSign) + ",";
-  json += "\"switchTriggered\":" + String(digitalRead(PIN_LIMIT_SWITCH) == LOW ? "true" : "false") + ",";
-  json += "\"homing\":" + String(homing ? "true" : "false") + ",";
-  json += "\"homeError\":" + String(homeError ? "true" : "false");
-  json += "}";
-  sendCorsHeaders();
-  server.send(200, "application/json", json);
-}
-
-void handleUpload() {
-  parseAndSaveSequence(server.arg("plain"));
-  sendCorsHeaders();
-  server.send(200, "text/plain", "ok");
-}
-
-void handleConfig() {
-  if (server.hasArg("numNails")) numNails = server.arg("numNails").toInt();
-  if (server.hasArg("stepDelay")) stepDelayMs = server.arg("stepDelay").toInt();
-  if (server.hasArg("autoMs")) autoAdvanceMs = server.arg("autoMs").toInt();
-  if (server.hasArg("dirSign")) dirSign = (server.arg("dirSign").toInt() < 0) ? -1 : 1;
-  if (server.hasArg("feederRestAngle")) feederRestAngle = (uint8_t)server.arg("feederRestAngle").toInt();
-  if (server.hasArg("feederFeedAngle")) feederFeedAngle = (uint8_t)server.arg("feederFeedAngle").toInt();
-  if (server.hasArg("feederPulseMs")) feederPulseMs = (uint16_t)server.arg("feederPulseMs").toInt();
-  if (server.hasArg("feederAutoFeed")) feederAutoFeed = server.arg("feederAutoFeed").toInt() != 0;
-  saveConfig();
-  if (!feederActive) feederServo.write(feederRestAngle); // reflect a new rest angle immediately
-  sendCorsHeaders();
-  server.send(200, "text/plain", "ok");
-}
-
-void handleAction() {
-  String cmd = server.arg("cmd");
-  if (homing && cmd != "findhome") {
-    // Ignore everything else while a homing seek is in flight -- the UI
-    // disables these buttons too, but guard here in case of a stale page.
-  } else if (cmd == "next") {
-    if (!sequence.empty() && currentIndex + 1 < (int)sequence.size()) {
-      currentIndex++;
-      beginMoveToStep(nailToStep(sequence[currentIndex]));
-      feederPendingAfterMove = feederAutoFeed;
-      saveState();
-    }
-  } else if (cmd == "prev") {
-    if (!sequence.empty() && currentIndex > 0) {
-      currentIndex--;
-      beginMoveToStep(nailToStep(sequence[currentIndex]));
-      saveState();
-    }
-  } else if (cmd == "home") {
-    // Declare the disc's CURRENT physical position to be nail 0, without moving it.
-    currentStep = 0;
-    targetStep = 0;
-    stepping = false;
-    currentIndex = 0;
-    saveState();
-  } else if (cmd == "findhome") {
-    // Physically verified homing: slowly seek until the limit switch trips.
-    int8_t dir = (server.hasArg("value") && server.arg("value").toInt() < 0) ? -1 : 1;
-    startHoming(dir);
-  } else if (cmd == "feed") {
-    startFeederPulse();
-  } else if (cmd == "goto") {
-    long nail = server.arg("value").toInt();
-    beginMoveToStep(nailToStep((uint16_t)nail));
-  } else if (cmd == "start") {
-    autoRunning = true;
-    lastAutoAdvanceAt = millis();
-  } else if (cmd == "stop") {
-    autoRunning = false;
-  }
-  sendCorsHeaders();
-  server.send(200, "text/plain", "ok");
-}
-
-void setupWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(300);
-    Serial.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nConnected. IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\nCould not join WiFi, starting fallback AP: " + String(AP_FALLBACK_SSID));
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_FALLBACK_SSID, AP_FALLBACK_PASSWORD);
-    Serial.println("AP IP: " + WiFi.softAPIP().toString());
-  }
-  if (MDNS.begin(HOSTNAME)) {
-    Serial.println("mDNS: http://" + String(HOSTNAME) + ".local/");
-  }
-}
-
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
-  pinMode(PIN_IN3, OUTPUT);
-  pinMode(PIN_IN4, OUTPUT);
-  coilsOff();
-
-  pinMode(PIN_LIMIT_SWITCH, INPUT_PULLUP);
-
-  LittleFS.begin();
-  loadConfig();
-  loadSequenceFromFile();
-  loadState();
-  if (currentIndex >= (int)sequence.size()) currentIndex = 0;
-  targetStep = currentStep; // start stationary at whatever we last saved as "home"
-
-  feederServo.attach(PIN_FEEDER_SERVO);
-  feederServo.write(feederRestAngle);
-
-  setupWiFi();
-
-  server.on("/", handleRoot);
-  server.on("/status", HTTP_GET, handleStatus);
-  server.on("/status", HTTP_OPTIONS, handleCorsPreflight);
-  server.on("/upload", HTTP_POST, handleUpload);
-  server.on("/upload", HTTP_OPTIONS, handleCorsPreflight);
-  server.on("/config", HTTP_POST, handleConfig);
-  server.on("/config", HTTP_OPTIONS, handleCorsPreflight);
-  server.on("/action", HTTP_POST, handleAction);
-  server.on("/action", HTTP_OPTIONS, handleCorsPreflight);
-  server.begin();
-  Serial.println("Web server started.");
-}
-
-void loop() {
-  server.handleClient();
-  MDNS.update();
-
-  if (homing) {
-    // Slow open-loop seek: step one half-step at a time until the limit
-    // switch trips, or we give up after HOME_STEP_CAP half-steps (broken
-    // wiring, a switch that never closes, etc.) rather than spin forever.
-    if (millis() - lastStepAt >= stepDelayMs) {
-      lastStepAt = millis();
-      if (digitalRead(PIN_LIMIT_SWITCH) == LOW) {
-        currentStep = 0;
-        targetStep = 0;
-        stepping = false;
-        currentIndex = 0;
-        saveState();
-        homing = false;
-        coilsOff();
-      } else if (homeStepCount >= HOME_STEP_CAP) {
-        homing = false;
-        homeError = true;
-        currentStep = homeStartStep; // don't leave the position tracker corrupted
-        coilsOff();
-      } else {
-        currentStep += homeDir;
-        halfStepIdx = (uint8_t)(((halfStepIdx + (homeDir > 0 ? 1 : -1)) + 8) % 8);
-        writeCoils(halfStepIdx);
-        homeStepCount++;
-      }
-    }
-  } else {
-    // Non-blocking half-step advance toward targetStep
-    if (stepping && millis() - lastStepAt >= stepDelayMs) {
-      lastStepAt = millis();
-      currentStep += stepDir;
-      halfStepIdx = (uint8_t)(((halfStepIdx + (stepDir > 0 ? 1 : -1)) + 8) % 8);
-      writeCoils(halfStepIdx);
-      if (currentStep == targetStep) {
-        stepping = false;
-        // Snap the tracker back into 0..STEPS_PER_REV-1. Every move is planned
-        // from an absolute target, so rounding error cannot accumulate across
-        // thousands of chords.
-        currentStep = normalizeStep(currentStep);
-        targetStep = currentStep;
-        coilsOff(); // de-energize coils while idle: less heat, no buzzing, no wasted current
-        if (feederPendingAfterMove) {
-          feederPendingAfterMove = false;
-          startFeederPulse();
-        }
-      }
-    }
-
-    // Optional hands-free auto-advance
-    if (autoRunning && !stepping && !sequence.empty() &&
-        currentIndex + 1 < (int)sequence.size() &&
-        millis() - lastAutoAdvanceAt >= autoAdvanceMs) {
-      lastAutoAdvanceAt = millis();
-      currentIndex++;
-      beginMoveToStep(nailToStep(sequence[currentIndex]));
-      feederPendingAfterMove = feederAutoFeed;
-      saveState();
-      if (currentIndex + 1 >= (int)sequence.size()) autoRunning = false;
-    }
-  }
-
-  // Feeder servo: non-blocking return-to-rest after a pulse
-  if (feederActive && millis() >= feederReturnAt) {
-    feederServo.write(feederRestAngle);
-    feederActive = false;
-  }
-}

@@ -97,7 +97,18 @@
 // page into web_page.h.
 // ---------------------------------------------------------------------------
 bool feederBusy();
+bool wrapBusy();
+bool servoBusy();
+void servoGoTo(uint8_t a);
+void servoSnapTo(uint8_t a);
+void serviceServo();
+long wrapSweepSteps();
 void saveState();
+long wrapLeadSteps();
+void startWrap(uint16_t nail);
+void serviceWrap();
+void abortWrap();
+void presentNail(uint16_t nail, bool doFeed);
 void writeCoils(uint8_t idx);
 void coilsOff();
 long normalizeStep(long s);
@@ -256,6 +267,85 @@ FeederPhase feederPhase = FEED_IDLE;
 unsigned long feederNextAt = 0;
 bool feederPendingAfterMove = false; // fire once the in-flight stepper move completes
 
+// ---------------- Servo slew ----------------
+//
+// Servo.write() commands a position and the SG90 slams to it as fast as its
+// gearing allows. There is no speed parameter. To move it slowly the angle has
+// to be walked in small increments, which is what this does -- non-blocking,
+// so the disc and the web server keep running while the arm creeps.
+//
+// Travel time = (angle to cover / servoSlewDeg) * servoSlewMs.
+// At the defaults, a 90 degree swing takes 45 * 20 = 900 ms.
+uint8_t servoCurrent = 0;
+uint8_t servoTarget = 0;
+unsigned long servoNextAt = 0;
+uint8_t servoSlewDeg = 2;    // degrees per increment; larger = faster, coarser
+uint16_t servoSlewMs = 20;   // ms between increments; larger = slower
+
+bool servoBusy() { return servoCurrent != servoTarget; }
+
+void servoGoTo(uint8_t a) { servoTarget = a; servoNextAt = millis(); }
+
+// Jump without slewing -- used at boot and when the rest angle is edited.
+void servoSnapTo(uint8_t a) {
+  servoTarget = a;
+  servoCurrent = a;
+  feederServo.write(a);
+}
+
+void serviceServo() {
+  if (servoCurrent == servoTarget) return;
+  if ((long)(millis() - servoNextAt) < 0) return;
+  int diff = (int)servoTarget - (int)servoCurrent;
+  int stepDeg = servoSlewDeg < 1 ? 1 : servoSlewDeg;
+  if (diff >= -stepDeg && diff <= stepDeg) servoCurrent = servoTarget;
+  else servoCurrent = (uint8_t)((int)servoCurrent + (diff > 0 ? stepDeg : -stepDeg));
+  feederServo.write(servoCurrent);
+  servoNextAt = millis() + servoSlewMs;
+}
+
+// ---------------- Wrap cycle ----------------
+//
+// The tube tip cannot wrap a nail by moving out and back along one line -- that
+// encloses nothing. It has to trace a closed loop around the nail, and with
+// only one servo axis the disc has to supply the other half of that loop:
+//
+//   1 APPROACH  disc moves so the tube sits half a nail BEFORE the target
+//   2 SETTLE    let the disc stop ringing
+//   3 OUT       servo swings the tube outside the nail ring (clear of nails,
+//               because it is midway between two of them)
+//   4 SWEEP     disc rotates one whole nail pitch while the tube stays out,
+//               carrying the thread around the far side of the target nail
+//   5 IN        servo brings the tube back inside, again midway between nails
+//   6 LAND      disc backs up half a pitch to sit exactly on the target
+//
+// Steps 3 to 5 are the loop: out on one side, across the back, in on the other.
+// That is one wrap. Step 6 does not undo it -- the tube stays inside the ring,
+// so it never re-crosses the thread.
+//
+// This is why the disc and the feeder MUST be allowed to move in the same
+// cycle. Earlier versions deliberately kept them apart, which is correct for a
+// feeder that only pays out thread and fatal for one that has to wrap.
+enum WrapPhase { WRAP_IDLE, WRAP_APPROACH, WRAP_SETTLE, WRAP_SERVO_IN,
+                 WRAP_HOLD_IN, WRAP_SWEEP, WRAP_HOLD_SWEEP, WRAP_SERVO_OUT,
+                 WRAP_RECOVER, WRAP_LAND };
+WrapPhase wrapPhase = WRAP_IDLE;
+unsigned long wrapNextAt = 0;
+uint16_t wrapTargetNail = 0;
+
+bool wrapMode = true;      // false = old behaviour, a simple pay-out pulse
+uint16_t wrapSteps = 0;    // where the servo crosses on approach; 0 = auto (half a pitch)
+uint16_t wrapSweep = 0;    // how far the disc travels during the sweep; 0 = auto (one pitch)
+int8_t wrapDir = 1;        // which side to approach from; flip if wraps shed
+
+// The two waits that give the thread time to seat. These are the ones that
+// matter for whether a wrap holds: the thread needs a moment to fall into
+// place after the tube swings, and again after the disc has carried it round.
+uint16_t wrapHoldInMs = 400;     // after the tube reaches the feed position
+uint16_t wrapHoldSweepMs = 400;  // after the sweep, before the tube comes back
+
+bool wrapBusy() { return wrapPhase != WRAP_IDLE; }
+
 // False when the saved position could not be trusted at boot (power was cut
 // mid-move). Cleared by any homing operation.
 bool positionKnown = true;
@@ -351,16 +441,122 @@ void armFeedAfterMove(bool wantFeed) {
   else lastAutoAdvanceAt = millis();
 }
 
+// Half a nail pitch by default: that puts the ring crossing exactly midway
+// between two nails, so the tube passes through a gap rather than into a nail,
+// and the swept loop encloses the target nail and nothing else.
+// Where the tube crosses the ring on the way in, as an offset from the target
+// nail. Half a pitch by default: the crossing then falls midway between two
+// nails, so the tube goes through a gap instead of into a nail.
+// Set it to 0 to stop on the nail itself before the servo moves.
+long wrapLeadSteps() {
+  if (wrapSteps > 0) return (long)wrapSteps * wrapDir;
+  if (numNails == 0) return 0;
+  long half = (STEPS_PER_REV_X100 / (long)numNails / 2 + 50L) / 100L;
+  if (half < 1) half = 1;
+  return half * wrapDir;
+}
+
+// How far the disc carries the thread round while the tube is out. One whole
+// nail pitch by default, which is what takes the thread past the target nail.
+long wrapSweepSteps() {
+  if (wrapSweep > 0) return (long)wrapSweep * wrapDir;
+  if (numNails == 0) return 0;
+  long pitch = (STEPS_PER_REV_X100 / (long)numNails + 50L) / 100L;
+  if (pitch < 1) pitch = 1;
+  return pitch * wrapDir;
+}
+
+void startWrap(uint16_t nail) {
+  wrapTargetNail = nail;
+  wrapPhase = WRAP_APPROACH;
+  wrapNextAt = millis();
+  // Straight to the approach position from wherever the disc is -- no need to
+  // stop on the nail first, so a wrap costs one normal move plus two short ones.
+  beginMoveToStep(normalizeStep(nailToStep(nail) + wrapLeadSteps()));
+}
+
+void abortWrap() {
+  if (wrapPhase == WRAP_IDLE) return;
+  wrapPhase = WRAP_IDLE;
+  servoGoTo(feederRestAngle);   // never leave the tube parked out over the nails
+}
+
+// One phase per call. Each either starts a disc move, starts a servo slew, or
+// sets a timer; the guards below then hold everything until that finishes, so
+// nothing overlaps except where the cycle deliberately wants it to.
+void serviceWrap() {
+  if (wrapPhase == WRAP_IDLE) return;
+  if (stepping) return;     // disc still travelling
+  if (servoBusy()) return;  // arm still slewing
+  if ((long)(millis() - wrapNextAt) < 0) return;
+
+  long nailStep = nailToStep(wrapTargetNail);
+
+  switch (wrapPhase) {
+    case WRAP_APPROACH:                          // disc has arrived
+      wrapPhase = WRAP_SETTLE;
+      wrapNextAt = millis() + feederSettleMs;    // let it stop ringing
+      break;
+
+    case WRAP_SETTLE:
+      servoGoTo(feederFeedAngle);                // tube swings to the feed side
+      wrapPhase = WRAP_SERVO_IN;
+      break;
+
+    case WRAP_SERVO_IN:                          // slew finished
+      wrapPhase = WRAP_HOLD_IN;
+      wrapNextAt = millis() + wrapHoldInMs;      // let the thread settle in
+      break;
+
+    case WRAP_HOLD_IN:
+      // The wrap itself: the disc carries the thread past the nail while the
+      // tube stays put.
+      beginMoveToStep(normalizeStep(nailStep + wrapLeadSteps() - wrapSweepSteps()));
+      wrapPhase = WRAP_SWEEP;
+      break;
+
+    case WRAP_SWEEP:                             // sweep finished
+      wrapPhase = WRAP_HOLD_SWEEP;
+      wrapNextAt = millis() + wrapHoldSweepMs;   // let the thread hook properly
+      break;
+
+    case WRAP_HOLD_SWEEP:
+      servoGoTo(feederRestAngle);                // tube comes back
+      wrapPhase = WRAP_SERVO_OUT;
+      break;
+
+    case WRAP_SERVO_OUT:                         // slew finished
+      wrapPhase = WRAP_RECOVER;
+      wrapNextAt = millis() + feederRecoverMs;
+      break;
+
+    case WRAP_RECOVER:
+      beginMoveToStep(nailStep);                 // sit exactly on the nail
+      wrapPhase = WRAP_LAND;
+      break;
+
+    case WRAP_LAND:
+      wrapPhase = WRAP_IDLE;
+      lastAutoAdvanceAt = millis();
+      saveState();
+      break;
+
+    default:
+      wrapPhase = WRAP_IDLE;
+  }
+}
+
 void serviceFeeder() {
   if (feederPhase == FEED_IDLE) return;
+  if (servoBusy()) return;
   if ((long)(millis() - feederNextAt) < 0) return;
 
   if (feederPhase == FEED_SETTLE) {
-    feederServo.write(feederFeedAngle);
+    servoGoTo(feederFeedAngle);
     feederPhase = FEED_PULSE;
     feederNextAt = millis() + feederPulseMs;
   } else if (feederPhase == FEED_PULSE) {
-    feederServo.write(feederRestAngle);
+    servoGoTo(feederRestAngle);
     feederPhase = FEED_RECOVER;
     feederNextAt = millis() + feederRecoverMs;
   } else {
@@ -372,6 +568,17 @@ void serviceFeeder() {
 }
 
 // ---- Homing (non-blocking seek toward the limit switch) -------------------
+// Single entry point for advancing to a nail. In wrap mode the whole cycle is
+// handed to the sequencer; otherwise it falls back to the old move-then-pulse.
+void presentNail(uint16_t nail, bool doFeed) {
+  if (doFeed && wrapMode) {
+    startWrap(nail);
+  } else {
+    beginMoveToStep(nailToStep(nail));
+    armFeedAfterMove(doFeed);
+  }
+}
+
 void startHoming(int8_t dir) {
   homing = true;
   homeError = false;
@@ -425,10 +632,12 @@ void loadState() {
 void saveConfig() {
   File f = LittleFS.open(CONFIG_FILE, "w");
   if (!f) return;
-  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n",
+  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n",
            numNails, stepDelayMs, (unsigned long)autoAdvanceMs,
            feederRestAngle, feederFeedAngle, feederPulseMs, feederAutoFeed ? 1u : 0u,
-           (int)dirSign, feederSettleMs, feederRecoverMs, autoHomeOnBoot ? 1u : 0u);
+           (int)dirSign, feederSettleMs, feederRecoverMs, autoHomeOnBoot ? 1u : 0u,
+           wrapMode ? 1u : 0u, wrapSteps, (int)wrapDir,
+           wrapSweep, wrapHoldInMs, wrapHoldSweepMs, servoSlewDeg, servoSlewMs);
   f.close();
 }
 
@@ -458,6 +667,15 @@ void loadConfig() {
   feederSettleMs = (uint16_t)readConfigLine(f, feederSettleMs);
   feederRecoverMs = (uint16_t)readConfigLine(f, feederRecoverMs);
   autoHomeOnBoot = readConfigLine(f, autoHomeOnBoot ? 1 : 0) != 0;
+  wrapMode = readConfigLine(f, wrapMode ? 1 : 0) != 0;
+  wrapSteps = (uint16_t)readConfigLine(f, wrapSteps);
+  wrapDir = (readConfigLine(f, wrapDir) < 0) ? -1 : 1;
+  wrapSweep = (uint16_t)readConfigLine(f, wrapSweep);
+  wrapHoldInMs = (uint16_t)readConfigLine(f, wrapHoldInMs);
+  wrapHoldSweepMs = (uint16_t)readConfigLine(f, wrapHoldSweepMs);
+  servoSlewDeg = (uint8_t)readConfigLine(f, servoSlewDeg);
+  servoSlewMs = (uint16_t)readConfigLine(f, servoSlewMs);
+  if (servoSlewDeg < 1) servoSlewDeg = 1;
   f.close();
   if (numNails == 0) numNails = DEF_NUM_NAILS;
   if (stepDelayMs == 0) stepDelayMs = DEF_STEP_DELAY_MS;
@@ -565,6 +783,17 @@ void handleStatus() {
   json += "\"stepsPerRevX100\":" + String(STEPS_PER_REV_X100) + ",";
   json += "\"switchTriggered\":" + String(digitalRead(PIN_LIMIT_SWITCH) == LOW ? "true" : "false") + ",";
   json += "\"homing\":" + String(homing ? "true" : "false") + ",";
+  json += "\"wrapMode\":" + String(wrapMode ? "true" : "false") + ",";
+  json += "\"wrapSteps\":" + String(wrapSteps) + ",";
+  json += "\"wrapAutoSteps\":" + String(labs(wrapLeadSteps())) + ",";
+  json += "\"wrapDir\":" + String((int)wrapDir) + ",";
+  json += "\"wrapSweep\":" + String(wrapSweep) + ",";
+  json += "\"wrapAutoSweep\":" + String(labs(wrapSweepSteps())) + ",";
+  json += "\"wrapHoldInMs\":" + String(wrapHoldInMs) + ",";
+  json += "\"wrapHoldSweepMs\":" + String(wrapHoldSweepMs) + ",";
+  json += "\"servoSlewDeg\":" + String(servoSlewDeg) + ",";
+  json += "\"servoSlewMs\":" + String(servoSlewMs) + ",";
+  json += "\"wrapBusy\":" + String(wrapBusy() ? "true" : "false") + ",";
   json += "\"positionKnown\":" + String(positionKnown ? "true" : "false") + ",";
   json += "\"autoHomeOnBoot\":" + String(autoHomeOnBoot ? "true" : "false") + ",";
   json += "\"homeError\":" + String(homeError ? "true" : "false");
@@ -592,8 +821,16 @@ void handleConfig() {
     feederPulseMs = DEF_FEEDER_PULSE_MS;
     feederSettleMs = DEF_FEEDER_SETTLE_MS;
     feederRecoverMs = DEF_FEEDER_RECOVER_MS;
+    wrapMode = true;
+    wrapSteps = 0;
+    wrapSweep = 0;
+    wrapDir = 1;
+    wrapHoldInMs = 400;
+    wrapHoldSweepMs = 400;
+    servoSlewDeg = 2;
+    servoSlewMs = 20;
     saveConfig();
-    if (!feederBusy()) feederServo.write(feederRestAngle);
+    if (!feederBusy() && !wrapBusy()) servoSnapTo(feederRestAngle);
     sendCorsHeaders();
     server.send(200, "text/plain", "ok");
     return;
@@ -608,9 +845,17 @@ void handleConfig() {
   if (server.hasArg("feederSettleMs")) feederSettleMs = (uint16_t)server.arg("feederSettleMs").toInt();
   if (server.hasArg("feederRecoverMs")) feederRecoverMs = (uint16_t)server.arg("feederRecoverMs").toInt();
   if (server.hasArg("autoHomeOnBoot")) autoHomeOnBoot = server.arg("autoHomeOnBoot").toInt() != 0;
+  if (server.hasArg("wrapMode")) wrapMode = server.arg("wrapMode").toInt() != 0;
+  if (server.hasArg("wrapSteps")) wrapSteps = (uint16_t)server.arg("wrapSteps").toInt();
+  if (server.hasArg("wrapDir")) wrapDir = (server.arg("wrapDir").toInt() < 0) ? -1 : 1;
+  if (server.hasArg("wrapSweep")) wrapSweep = (uint16_t)server.arg("wrapSweep").toInt();
+  if (server.hasArg("wrapHoldInMs")) wrapHoldInMs = (uint16_t)server.arg("wrapHoldInMs").toInt();
+  if (server.hasArg("wrapHoldSweepMs")) wrapHoldSweepMs = (uint16_t)server.arg("wrapHoldSweepMs").toInt();
+  if (server.hasArg("servoSlewDeg")) { servoSlewDeg = (uint8_t)server.arg("servoSlewDeg").toInt(); if (servoSlewDeg < 1) servoSlewDeg = 1; }
+  if (server.hasArg("servoSlewMs")) servoSlewMs = (uint16_t)server.arg("servoSlewMs").toInt();
   if (server.hasArg("feederAutoFeed")) feederAutoFeed = server.arg("feederAutoFeed").toInt() != 0;
   saveConfig();
-  if (!feederBusy()) feederServo.write(feederRestAngle); // reflect a new rest angle immediately
+  if (!feederBusy() && !wrapBusy()) servoSnapTo(feederRestAngle); // show a new rest angle at once
   sendCorsHeaders();
   server.send(200, "text/plain", "ok");
 }
@@ -620,14 +865,14 @@ void handleAction() {
   if (homing && cmd != "findhome") {
     // Ignore everything else while a homing seek is in flight -- the UI
     // disables these buttons too, but guard here in case of a stale page.
-  } else if (feederBusy() && (cmd == "next" || cmd == "prev" || cmd == "goto")) {
+  } else if ((feederBusy() || wrapBusy()) &&
+             (cmd == "next" || cmd == "prev" || cmd == "goto" || cmd == "gotostep")) {
     // A feed is mid-cycle. Starting a move now would drag thread out of the
     // servo's grip; the caller can retry in a few hundred ms.
   } else if (cmd == "next") {
     if (!sequence.empty() && currentIndex + 1 < (int)sequence.size()) {
       currentIndex++;
-      beginMoveToStep(nailToStep(sequence[currentIndex]));
-      armFeedAfterMove(feederAutoFeed);
+      presentNail(sequence[currentIndex], feederAutoFeed);
       saveState();
     }
   } else if (cmd == "prev") {
@@ -638,6 +883,7 @@ void handleAction() {
       saveState();
     }
   } else if (cmd == "home") {
+    abortWrap();
     // Declare the disc's CURRENT physical position to be nail 0, without moving it.
     currentStep = 0;
     targetStep = 0;
@@ -646,6 +892,7 @@ void handleAction() {
     positionKnown = true;   // the operator has told us where zero is
     saveState();
   } else if (cmd == "findhome") {
+    abortWrap();
     // Physically verified homing: slowly seek until the limit switch trips.
     int8_t dir = (server.hasArg("value") && server.arg("value").toInt() < 0) ? -1 : 1;
     startHoming(dir);
@@ -662,6 +909,12 @@ void handleAction() {
       armFeedAfterMove(false);
       saveState();
     }
+  } else if (cmd == "wraptest") {
+    // One wrap cycle on the nail currently at the feeder, for tuning the
+    // overshoot and servo angles without committing to a run.
+    if (!sequence.empty() && currentIndex < (int)sequence.size()) {
+      startWrap(sequence[currentIndex]);
+    }
   } else if (cmd == "feed") {
     requestFeed(false);   // manual press: nothing is moving, no settle needed
   } else if (cmd == "goto") {
@@ -671,6 +924,7 @@ void handleAction() {
     autoRunning = true;
     lastAutoAdvanceAt = millis();
   } else if (cmd == "stop") {
+    abortWrap();
     autoRunning = false;
   }
   sendCorsHeaders();
@@ -732,7 +986,7 @@ void setup() {
   }
 
   feederServo.attach(PIN_FEEDER_SERVO);
-  feederServo.write(feederRestAngle);
+  servoSnapTo(feederRestAngle);
 
   setupWiFi();
 
@@ -817,12 +1071,11 @@ void loop() {
 
     // Optional hands-free auto-advance. Waits for the feeder as well as the
     // stepper, so the disc never starts turning with thread still being fed.
-    if (autoRunning && !stepping && !feederBusy() && !sequence.empty() &&
+    if (autoRunning && !stepping && !feederBusy() && !wrapBusy() && !sequence.empty() &&
         currentIndex + 1 < (int)sequence.size() &&
         millis() - lastAutoAdvanceAt >= autoAdvanceMs) {
       currentIndex++;
-      beginMoveToStep(nailToStep(sequence[currentIndex]));
-      armFeedAfterMove(feederAutoFeed);
+      presentNail(sequence[currentIndex], feederAutoFeed);
       saveState();
       if (currentIndex + 1 >= (int)sequence.size()) autoRunning = false;
     }
@@ -830,4 +1083,8 @@ void loop() {
 
   // Feeder servo: advances the settle -> pulse -> recover cycle
   serviceFeeder();
+  // Wrap sequencer: interleaves disc moves and servo swings
+  serviceWrap();
+  // Servo slew: walks the arm toward its target one increment at a time
+  serviceServo();
 }

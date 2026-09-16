@@ -7,6 +7,115 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.6.1] — 2026-09-16
+
+### Added
+
+- **Servo speed control.** `Servo.write()` commands a position and the SG90
+  slams to it as fast as its gearing allows — there is no speed parameter. The
+  arm is now walked to its target in increments (`servoSlewDeg` degrees every
+  `servoSlewMs` ms), non-blocking, so the disc and web server keep running
+  while it creeps. A 90° swing takes 900 ms at the defaults instead of roughly
+  150 ms. Both the wrap cycle and the plain pay-out pulse use it.
+
+- **Two waits where the thread has to seat**, which are the ones that decide
+  whether a wrap holds:
+  - `wrapHoldInMs` (400 ms) after the tube reaches the feed position
+  - `wrapHoldSweepMs` (400 ms) after the sweep, before the tube comes back
+
+- **Sweep distance** as its own setting, independent of the approach offset.
+  Previously one number controlled both, so the approach could not be moved
+  without changing how far the thread was carried.
+
+### Changed
+
+- **Wrap cycle reordered** to approach → settle → tube in → wait → sweep →
+  wait → tube out → recover → land. The sequencer waits on `servoBusy()` as
+  well as `stepping`, so a phase never starts while the arm is still slewing.
+
+- The wrap breakdown now reports where the tube crosses the ring at **both**
+  ends in nail pitches, the servo travel time, and the total fixed cycle time.
+  It warns when either crossing would land on a nail rather than in a gap.
+
+- "Overshoot each way" is now "Approach offset" — 0 stops on the nail itself
+  before the servo moves, which is what you want if the tube has room to cross
+  there.
+
+### Notes
+
+- Default cycle is about 3.8 s per nail of fixed time, plus disc travel and
+  your dwell. Most of that is the two 900 ms servo slews; raise `servoSlewDeg`
+  or drop `servoSlewMs` once you know how slow it actually needs to be.
+
+- Five more lines in `/config.txt`. Older files load unchanged.
+
+---
+
+## [1.6.0] — 2026-09-16
+
+### Added
+
+- **Wrap cycle.** The feeder now traces a closed loop around each nail instead
+  of pushing out and back along one line. With a single servo axis the disc
+  supplies half the loop, so the cycle is six phases:
+
+  | Phase | What moves |
+  |---|---|
+  | Approach | disc, to half a nail short of the target |
+  | Settle | nothing — let the disc stop ringing |
+  | Out | servo swings the tube outside the ring |
+  | Sweep | disc, one whole nail pitch, tube still out |
+  | In | servo brings the tube back inside |
+  | Land | disc backs up half a pitch onto the nail |
+
+  Out, Sweep and In are the loop. Land does not undo it: the tube stays inside
+  the ring and never re-crosses the thread.
+
+- **Auto overshoot** of half a nail pitch, so the ring crossings fall exactly
+  midway between nails — the tube passes through a gap rather than into a nail,
+  and the loop encloses the target and nothing else. Overridable in steps.
+
+- **Approach-from-the-other-side** toggle, which reverses the handedness of
+  every wrap. Flip it if wraps shed.
+
+- **Test one wrap** button, running a single cycle on the current nail for
+  tuning without committing to a run. New `wraptest` action.
+
+- A wrap breakdown in the UI showing the overshoot in steps, degrees and
+  fractions of a nail pitch, warning when it is too small to clear the nail or
+  large enough to enclose two.
+
+- `wrapMode`, `wrapSteps`, `wrapAutoSteps`, `wrapDir` and `wrapBusy` in
+  `/status`; the first three persisted as three more lines in `/config.txt`.
+
+### Changed
+
+- **The disc and the feeder may now move in the same cycle.** Auto-advance
+  waits for `wrapBusy()` rather than keeping the two apart. The old mutual
+  exclusion is correct for a feeder that only pays out thread and fatal for one
+  that has to wrap — the Sweep phase *is* the disc moving with the servo
+  extended.
+
+- Advances go through one `presentNail()` entry point, which hands off to the
+  wrap sequencer or falls back to the old move-then-pulse when wrapping is off.
+
+- Stop, Set Home and Find Home abort a wrap in progress and return the servo to
+  rest, so the tube is never left parked out over the nails.
+
+- "Pulse duration" relabelled "Servo travel" — in wrap mode it is how long the
+  servo is given to swing, not how long thread is paid out.
+
+### Notes
+
+- Wrapping is on by default. Turning it off restores the old pay-out pulse,
+  which cannot hook a nail; the UI says so.
+
+- A wrap costs one normal move plus two short ones (about 1.5 nail pitches of
+  extra travel), because Approach goes straight to the pre-position rather than
+  stopping on the nail first.
+
+---
+
 ## [1.5.0] — 2026-09-16
 
 ### Fixed

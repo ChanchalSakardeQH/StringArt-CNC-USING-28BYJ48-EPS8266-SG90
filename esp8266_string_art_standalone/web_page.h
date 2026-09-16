@@ -448,13 +448,55 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     </details>
 
     <details open>
-      <summary>Feed cycle</summary>
+      <summary>Wrap cycle</summary>
+      <div class="switch-row">
+        <span>Wrap thread around each nail</span>
+        <label class="switch"><input type="checkbox" id="wrapMode"><span class="slider"></span></label>
+      </div>
+      <div class="idx-sub" style="margin-top:0;text-align:left">
+        Off = the old behaviour: the servo just pays thread out and the disc
+        never moves while it is extended. That cannot hook a nail.
+      </div>
+      <div class="field">
+        <label>Approach offset <span class="val">steps, 0 = on the nail</span></label>
+        <input id="wrapSteps" type="number" min="0" max="200">
+      </div>
+      <div class="field">
+        <label>Sweep distance <span class="val">steps, 0 = one nail</span></label>
+        <input id="wrapSweep" type="number" min="0" max="400">
+      </div>
+      <div class="field">
+        <label>Wait after tube moves in <span class="val">ms</span></label>
+        <input id="wrapHoldInMs" type="number" min="0" max="10000" step="50">
+      </div>
+      <div class="field">
+        <label>Wait after sweep <span class="val">ms</span></label>
+        <input id="wrapHoldSweepMs" type="number" min="0" max="10000" step="50">
+      </div>
+      <div class="field">
+        <label>Servo speed <span class="val">&deg; per step</span></label>
+        <input id="servoSlewDeg" type="number" min="1" max="90">
+      </div>
+      <div class="field">
+        <label>Servo step interval <span class="val">ms</span></label>
+        <input id="servoSlewMs" type="number" min="0" max="500" step="5">
+      </div>
+      <div class="switch-row">
+        <span>Approach from the other side</span>
+        <label class="switch"><input type="checkbox" id="wrapDirFlip"><span class="slider"></span></label>
+      </div>
+      <div class="sync-box" id="wrapBreakdown">&mdash;</div>
+      <button class="ghost" id="wrapTestBtn">Test one wrap</button>
+    </details>
+
+    <details open>
+      <summary>Timings</summary>
       <div class="field">
         <label>Settle before feed <span class="val">ms</span></label>
         <input id="feederSettleMs" type="number" min="0" max="10000" step="50">
       </div>
       <div class="field">
-        <label>Pulse duration <span class="val">ms</span></label>
+        <label>Servo travel <span class="val">ms</span></label>
         <input id="feederPulseMs" type="number" min="0" max="10000" step="50">
       </div>
       <div class="field">
@@ -1046,6 +1088,16 @@ window.NailCount = (function(){
   const idxGotoStepHint = document.getElementById("idxGotoStepHint");
   const idxResumeBanner = document.getElementById("idxResumeBanner");
   const idxAutoHome = document.getElementById("idxAutoHome");
+  const wrapMode = document.getElementById("wrapMode");
+  const wrapSteps = document.getElementById("wrapSteps");
+  const wrapDirFlip = document.getElementById("wrapDirFlip");
+  const wrapBreakdown = document.getElementById("wrapBreakdown");
+  const wrapTestBtn = document.getElementById("wrapTestBtn");
+  const wrapSweep = document.getElementById("wrapSweep");
+  const wrapHoldInMs = document.getElementById("wrapHoldInMs");
+  const wrapHoldSweepMs = document.getElementById("wrapHoldSweepMs");
+  const servoSlewDeg = document.getElementById("servoSlewDeg");
+  const servoSlewMs = document.getElementById("servoSlewMs");
   const feederAutoFeed = document.getElementById("feederAutoFeed");
   const feederFeedBtn = document.getElementById("feederFeedBtn");
   const feederRestAngle = document.getElementById("feederRestAngle");
@@ -1067,7 +1119,9 @@ window.NailCount = (function(){
   // A field goes "dirty" on first keystroke and is left alone until it is
   // saved or the panel is reset.
   const advFields = [idxNumNails, idxStepDelay, idxAutoMs, feederRestAngle,
-                     feederFeedAngle, feederPulseMs, feederSettleMs, feederRecoverMs];
+                     feederFeedAngle, feederPulseMs, feederSettleMs, feederRecoverMs,
+                     wrapSteps, wrapSweep, wrapHoldInMs, wrapHoldSweepMs,
+                     servoSlewDeg, servoSlewMs];
   const dirty = new Set();
   advFields.forEach(f => f.addEventListener("input", () => {
     dirty.add(f.id);
@@ -1127,6 +1181,15 @@ window.NailCount = (function(){
         ? "0 to " + (j.total - 1) + ", currently on " + j.currentIndex + "."
         : "No sequence loaded yet.";
       if (document.activeElement !== idxAutoHome) idxAutoHome.checked = j.autoHomeOnBoot;
+      if (document.activeElement !== wrapMode) wrapMode.checked = j.wrapMode;
+      if (document.activeElement !== wrapDirFlip) wrapDirFlip.checked = (j.wrapDir < 0);
+      syncField(wrapSteps, j.wrapSteps);
+      syncField(wrapSweep, j.wrapSweep);
+      syncField(wrapHoldInMs, j.wrapHoldInMs);
+      syncField(wrapHoldSweepMs, j.wrapHoldSweepMs);
+      syncField(servoSlewDeg, j.servoSlewDeg);
+      syncField(servoSlewMs, j.servoSlewMs);
+      renderWrapBreakdown(j);
 
       // Shown only when the saved position could not be trusted at boot.
       if (j.positionKnown === false) {
@@ -1197,7 +1260,15 @@ window.NailCount = (function(){
       "&feederSettleMs=" + feederSettleMs.value +
       "&feederRecoverMs=" + feederRecoverMs.value +
       "&feederAutoFeed=" + (feederAutoFeed.checked ? 1 : 0) +
-      "&autoHomeOnBoot=" + (idxAutoHome.checked ? 1 : 0);
+      "&autoHomeOnBoot=" + (idxAutoHome.checked ? 1 : 0) +
+      "&wrapMode=" + (wrapMode.checked ? 1 : 0) +
+      "&wrapSteps=" + wrapSteps.value +
+      "&wrapDir=" + (wrapDirFlip.checked ? -1 : 1) +
+      "&wrapSweep=" + wrapSweep.value +
+      "&wrapHoldInMs=" + wrapHoldInMs.value +
+      "&wrapHoldSweepMs=" + wrapHoldSweepMs.value +
+      "&servoSlewDeg=" + servoSlewDeg.value +
+      "&servoSlewMs=" + servoSlewMs.value;
     try {
       await fetch("/config", {
         method: "POST",
@@ -1233,6 +1304,51 @@ window.NailCount = (function(){
   // The direction toggle is a switch, not a text field, so it saves at once.
   idxReverseDir.addEventListener("change", saveAdvanced);
   idxAutoHome.addEventListener("change", saveAdvanced);
+  wrapMode.addEventListener("change", saveAdvanced);
+  wrapDirFlip.addEventListener("change", saveAdvanced);
+  wrapTestBtn.addEventListener("click", () => idxAct("wraptest"));
+
+  // Shows the loop the tube will actually trace, in steps and in nails, so an
+  // overshoot that is too small to clear the neighbouring nails is obvious
+  // before you run it rather than after a hundred dropped wraps.
+  function renderWrapBreakdown(j){
+    if (!j.wrapMode) {
+      wrapBreakdown.className = "sync-box approx";
+      wrapBreakdown.innerHTML =
+        "<b>Wrapping off.</b> <span class=\"dim\">The servo pays thread out and " +
+        "retracts along the same path, which encloses nothing. The thread will " +
+        "not stay on a nail.</span>";
+      return;
+    }
+    const perNail = (j.stepsPerRevX100 / 100) / j.numNails;
+    const lead = j.wrapSteps > 0 ? j.wrapSteps : j.wrapAutoSteps;
+    const sweep = j.wrapSweep > 0 ? j.wrapSweep : j.wrapAutoSweep;
+    const startF = lead / perNail;          // where the tube crosses going in
+    const endF = (lead - sweep) / perNail;  // and coming back out
+    const travel = Math.abs(j.feederFeedAngle - j.feederRestAngle);
+    const slewMs = Math.ceil(travel / Math.max(1, j.servoSlewDeg)) * j.servoSlewMs;
+    const total = j.feederSettleMs + slewMs + j.wrapHoldInMs +
+                  j.wrapHoldSweepMs + slewMs + j.feederRecoverMs;
+
+    // A crossing lands safely when it falls near the middle of a gap between
+    // nails; at a whole number of pitches it is going straight at a nail.
+    const nearNail = (f) => Math.abs(f - Math.round(f)) < 0.25;
+    const risky = nearNail(startF) || nearNail(endF);
+
+    wrapBreakdown.className = "sync-box " + (risky ? "approx" : "exact");
+    wrapBreakdown.innerHTML =
+      "Tube crosses the ring at <b>" + startF.toFixed(2) + "</b> and <b>" +
+      endF.toFixed(2) + "</b> nails from the target<br>" +
+      "<span class=\"dim\">sweep " + sweep + " steps = " +
+      (sweep / perNail).toFixed(2) + " of a pitch &middot; servo " + travel +
+      "&deg; in " + (slewMs / 1000).toFixed(2) + " s each way</span><br>" +
+      "<span class=\"dim\">cycle " + (total / 1000).toFixed(2) +
+      " s per nail, plus disc travel and dwell.</span>" +
+      (risky
+        ? "<br><b>A crossing lands on a nail.</b> Offset or sweep needs " +
+          "adjusting so both land near .5 of a pitch."
+        : "");
+  }
 
   // Third view of the shared nail count.
   idxNumNails.addEventListener("input", () => NailCount.set(idxNumNails.value, "machine-settings"));

@@ -22,7 +22,10 @@ second device.
 - [First run](#first-run)
 - [Using it](#using-it)
 - [Machine settings](#machine-settings)
+- [Base template designer](#base-template-designer)
+- [Power cuts](#power-cuts)
 - [Rotation direction](#rotation-direction)
+- [Which gear ratio](#which-gear-ratio)
 - [HTTP API](#http-api)
 - [Files on flash](#files-on-flash)
 - [Troubleshooting](#troubleshooting)
@@ -79,6 +82,22 @@ ground when the disc's home mark passes. No external resistor.
 
 ## Flashing
 
+The sketch is two files. Keep them together in a folder named after the `.ino`:
+
+```
+esp8266_string_art_standalone/
+    esp8266_string_art_standalone.ino    firmware
+    web_page.h                           the web UI, one PROGMEM string
+```
+
+`web_page.h` is separate for a reason. Arduino preprocesses `.ino` files before
+compiling — inserting includes and generated prototypes — and that step does
+not reliably handle a ~100 KB C++11 raw string literal. When it cuts the string
+short, the browser code inside gets compiled as C++ and you get
+`expected constructor, destructor, or type conversion before '(' token`
+pointing at minified JavaScript. Arduino does not preprocess `.h` files, so
+keeping the page there avoids it. **Do not paste it back into the `.ino`.**
+
 1. **Board Manager** → install *esp8266* by ESP8266 Community.
 2. **Tools → Board** → e.g. *NodeMCU 1.0 (ESP-12E Module)*.
 3. **Tools → Flash Size** → any option that includes a LittleFS partition.
@@ -123,8 +142,8 @@ if you want to wrap by hand from a printout.
 around it, press **Next**, repeat. **Start Auto** advances on a timer instead,
 which works once you have a rhythm.
 
-Progress is saved after every advance, so a power cut costs you one nail, not
-the whole piece. The disc de-energises between moves — it will not hold
+Progress is saved twice per nail — when a move starts and when it lands — so a
+power cut costs you nothing. See [Power cuts](#power-cuts). The disc de-energises between moves — it will not hold
 position against a hard pull, but it also will not cook itself or buzz.
 
 ---
@@ -133,13 +152,79 @@ position against a hard pull, but it also will not cook itself or buzz.
 
 | Setting | What it does |
 |---|---|
-| Number of nails | Must match the generator. Wrong value mis-indexes everything |
+| Number of nails | Shared with the Design slider and the base designer — set it anywhere |
 | Step delay (ms/half-step) | Lower is faster. Too low stalls the motor — 2 ms is a sane floor, raise it if the disc is heavy |
 | Auto-advance interval | Dwell time per nail in Auto mode |
 | Reverse rotation direction | See below |
 
-Feeder servo settings — rest angle, feed angle, pulse duration and auto-feed —
-live in their own panel. All settings persist to flash.
+Feeder servo settings live in their own panel. All settings persist to flash.
+
+### Nail count is shared
+
+The Design slider, the base template field and the machine settings field are
+three views of one number. Change it in any of them and the other two follow,
+then it saves to the machine a moment after you stop typing. There is nothing
+to keep in sync by hand, and no way to print a base for one count while the
+indexer runs another.
+
+### The wrap cycle
+
+A feeder that pushes out and pulls back along the same line cannot hook a nail
+— that path encloses nothing, so the thread touches the nail and lets go. The
+guide has to trace a closed loop around it, and with one servo axis the disc
+supplies half of that loop.
+
+| Phase | What moves | Default |
+|---|---|---|
+| Approach | disc, to the approach offset | — |
+| Settle | nothing — let the disc stop ringing | 800 ms |
+| Tube in | servo slews to the feed position | 900 ms |
+| Wait | let the thread seat | 400 ms |
+| Sweep | disc, one nail pitch, tube still there | — |
+| Wait | let the thread hook | 400 ms |
+| Tube out | servo slews back | 900 ms |
+| Recover | settle before moving on | 400 ms |
+| Land | disc onto the nail | — |
+
+The servo is walked to its target a couple of degrees at a time rather than
+commanded straight there — `Servo.write()` has no speed parameter, so an SG90
+slams to position otherwise. Servo speed and both waits are adjustable.
+
+The overshoot defaults to half a nail pitch each way, which puts both ring
+crossings exactly midway between nails. **Test one wrap** in Advanced → Wrap
+cycle runs a single cycle so you can tune it without starting a run. If wraps
+shed, try *Approach from the other side* first — it reverses the handedness.
+
+Three things have to be true mechanically or no timing will save it:
+
+- The tube tip must end up **outside the nail ring** when the servo is out.
+- It must cross at **shank height, below the nail heads**.
+- The thread needs **upstream tension** — a brake on the spool. Slack thread
+  falls off a nail however well it is wrapped.
+
+### The timings
+
+Each phase is timed by:
+
+| Phase | Default | What it is for |
+|---|---|---|
+| Settle | 800 ms | The disc is still ringing the instant a move ends. Feeding into that snatches the thread |
+| Pulse | 300 ms | Servo at the feed angle, paying out thread |
+| Recover | 400 ms | Servo back at rest, thread stops swinging before the disc moves |
+| Dwell | `autoMs` | Your wrapping time, measured *after* the feed completes |
+
+All four live under **Advanced settings → Timings**, with a breakdown that
+updates as you type. Fields you are editing are never overwritten by the
+status poll, so changes hold until you press Save.
+
+Auto-advance waits for the whole cycle, so the disc never starts turning with
+thread still being fed, and Next / Prev are refused mid-feed. The panel shows
+the resulting per-nail cycle time as you adjust the numbers.
+
+If the thread still snatches, raise Settle first — it is almost always the
+disc not having stopped rather than the servo being too quick. Watch the disc
+and count: whatever looks like "stopped" is usually about twice as long as you
+think. **Restore defaults** puts everything back if you lose the thread of it.
 
 ---
 
@@ -163,15 +248,96 @@ nails the opposite way round the canvas from your physical frame. Fix it in
 the generator's nail layout — flipping `dirSign` back to compensate would
 break indexing all over again.
 
-### A note on step counts
+---
 
-One output revolution of a 28BYJ-48 is **4075.77** half-steps, not the 4096
-usually quoted. The internal gearbox is 63.68395:1, not 64:1. Using 4096 puts
-every nail about 0.5% too far round, which is roughly 1.8° of error by the
-time the disc gets back to nail 0 — enough to smear the last chords of a long
-sequence. The firmware uses the exact figure in integer arithmetic and snaps
-the position tracker back to an absolute target after every move, so nothing
-accumulates.
+## Power cuts
+
+The disc holds its position mechanically when the coils are off, so a power cut
+does not move anything. What matters is whether the firmware still knows where
+it is, and there are two cases.
+
+**Cut while idle between nails** — the common one. The saved position is exact.
+It picks up from the same step with nothing to do.
+
+**Cut during a move** — the disc stopped somewhere between two nails and there
+is no way to tell where without a reference. The firmware restores the position
+it was heading for, flags it unverified, and the Wrap section shows a banner
+asking you to home before carrying on. Progress is kept in both cases.
+
+To recover the reference:
+
+- **With a limit switch**, turn on *Find home on power-up* (Advanced → Motor).
+  The machine homes at boot and drives back to the saved nail by itself. It
+  will not start wrapping again on its own.
+- **Without one**, line nail 0 up with the feeder and press Set Home. Progress
+  is untouched, so press Next and it carries on from the right chord.
+
+If you lose your place some other way, **Go to step #** puts you anywhere in
+the sequence and takes progress with it.
+
+---
+
+## Which gear ratio
+
+All motor geometry comes from three constants at the top of the sketch:
+
+```cpp
+constexpr long MOTOR_INTERNAL_STEPS     = 32;        // full steps per internal rev
+constexpr bool MOTOR_HALF_STEP          = true;      // this firmware half-steps
+constexpr long MOTOR_GEAR_RATIO_X100000 = 6400000L;  // 64.00000 : 1
+```
+
+Steps per revolution is derived from them, so nothing else hardcodes a number.
+As shipped that is **32 × 2 × 64 = 4096 half-steps** (2048 full-steps).
+
+There are two candidate ratios for a 28BYJ-48:
+
+| Ratio | Half-steps/rev | Notes |
+|---|---|---|
+| `6400000` — 64.00000:1 | 4096 | The figure printed on the motor. Counts like 64, 128 and 256 divide evenly |
+| `6368395` — 63.68395:1 | 4075.77 | What you get from the actual gear teeth: 32/9 × 22/11 × 26/9 × 31/10 |
+
+Units differ, so measure rather than assume. Set nail count to 1, home the
+disc, mark the frame, then `goto` nail 0 ten times — ten full revolutions.
+If the mark returns true, keep 64:1. If it has crept about 18° round, switch
+to `6368395` and re-home.
+
+The distinction only matters for error that accumulates over whole
+revolutions. Within one revolution, rounding a nail to the nearest half-step
+costs at most ±0.044°, which is 0.15 mm at a 200 mm radius — smaller than the
+nail itself.
+
+---
+
+## Base template designer
+
+Section **4 · Base template** on the machine's page draws the numbered nail
+ring for the physical base: live preview, real-size SVG export, optional
+laser-cut circle, centre drill mark, and a red dot at every nail position.
+
+It reads the motor profile from the machine rather than assuming one, and
+reports what your chosen count actually costs:
+
+- steps per nail, degrees per nail, and nail pitch in mm
+- whether the count divides the step grid evenly
+- worst-case placement error in degrees and mm when it doesn't
+- the nearest counts that *do* divide evenly, as one-tap buttons
+- warnings when nails would be closer than 3 mm, or fewer than 2 steps apart
+
+**Use this nail count** pushes the value straight to the machine's `numNails`
+setting, so the printed base, the chord generator and the indexer stay in
+agreement.
+
+### Printing it
+
+Download the SVG and print at **100% scale** with "fit to page" turned off —
+the file carries real millimetre dimensions, so any scaling silently ruins the
+nail spacing. The panel names the smallest A-series and US sheet that fits.
+
+Nail **0 sits at three o'clock and numbering increases clockwise** when viewed
+from the printed side. This matches the chord generator and the Python
+generator, so a nail index means the same physical nail throughout. Glue the
+template printed-side up, and align nail 0 with the feeder before homing.
 
 ---
 
@@ -240,6 +406,6 @@ and watch it change.
 
 ---
 
-## Copy Rights 
+## Credits
 
-Chanchal Sakarde All Rights Reserved 
+Chanchal Sakarde. All Rights reserved.

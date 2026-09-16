@@ -201,6 +201,13 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   details summary{ cursor:pointer; font-size:.82rem; color:var(--text-dim); font-weight:600; margin-bottom:10px; }
   details .field{ margin-bottom:10px; }
 
+  .resume-banner{
+    font-size:.78rem; line-height:1.5; border-radius:8px; padding:9px 11px;
+    border:1px solid var(--warn); border-left-width:3px;
+    background:var(--bg); color:var(--text); margin-top:10px;
+  }
+  .resume-banner b{ display:block; margin-bottom:2px; }
+
   /* Base template designer */
   .sync-box{
     font-family:"IBM Plex Mono",monospace; font-size:.75rem; line-height:1.6;
@@ -317,16 +324,25 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     <button class="secondary" id="idxFindHomeBtn" style="margin-top:8px">Find Home (limit switch)</button>
     <div class="idx-sub" id="idxSwitchText">limit switch: &mdash;</div>
 
-    <details>
-      <summary>Jump to a nail</summary>
-      <div class="field">
-        <label>Jump motor to nail # <span class="val">no progress change</span></label>
-        <div class="btn-pair">
-          <input id="idxGotoVal" type="number" min="0">
-          <button class="ghost" id="idxGotoBtn" style="width:auto;flex:none;padding:8px 16px">Go</button>
-        </div>
+    <div class="resume-banner" id="idxResumeBanner" hidden></div>
+
+    <div class="field" style="margin-top:14px">
+      <label>Go to step # <span class="val">moves progress</span></label>
+      <div class="btn-pair">
+        <input id="idxGotoStepVal" type="number" min="0">
+        <button class="secondary" id="idxGotoStepBtn" style="width:auto;flex:none;padding:8px 16px">Go</button>
       </div>
-    </details>
+      <div class="stat-line" id="idxGotoStepHint">&mdash;</div>
+    </div>
+
+    <div class="field">
+      <label>Go to nail # <span class="val">disc only</span></label>
+      <div class="btn-pair">
+        <input id="idxGotoVal" type="number" min="0">
+        <button class="ghost" id="idxGotoBtn" style="width:auto;flex:none;padding:8px 16px">Go</button>
+      </div>
+      <div class="stat-line">Rotates the disc without changing where you are in the sequence.</div>
+    </div>
 
     <hr>
 
@@ -420,6 +436,15 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       </div>
       <button class="ghost" id="idxDirTestBtn">Run direction test</button>
       <div class="idx-sub" id="idxDirTestText" style="text-align:left">&nbsp;</div>
+      <div class="switch-row">
+        <span>Find home on power-up</span>
+        <label class="switch"><input type="checkbox" id="idxAutoHome"><span class="slider"></span></label>
+      </div>
+      <div class="idx-sub" style="margin-top:0;text-align:left">
+        After a power cut, home against the limit switch and drive back to the
+        saved nail. Needs the switch fitted. The disc does not start running
+        again on its own.
+      </div>
     </details>
 
     <details open>
@@ -1016,6 +1041,11 @@ window.NailCount = (function(){
   const idxReverseDir = document.getElementById("idxReverseDir");
   const idxDirTestBtn = document.getElementById("idxDirTestBtn");
   const idxDirTestText = document.getElementById("idxDirTestText");
+  const idxGotoStepVal = document.getElementById("idxGotoStepVal");
+  const idxGotoStepBtn = document.getElementById("idxGotoStepBtn");
+  const idxGotoStepHint = document.getElementById("idxGotoStepHint");
+  const idxResumeBanner = document.getElementById("idxResumeBanner");
+  const idxAutoHome = document.getElementById("idxAutoHome");
   const feederAutoFeed = document.getElementById("feederAutoFeed");
   const feederFeedBtn = document.getElementById("feederFeedBtn");
   const feederRestAngle = document.getElementById("feederRestAngle");
@@ -1093,6 +1123,22 @@ window.NailCount = (function(){
           : "step " + j.currentIndex + " / " + j.total + "  (next: nail " + j.nextNail + ")";
       idxBar.value = j.total ? (100 * j.currentIndex / j.total) : 0;
       NailCount.adopt(j.numNails);
+      idxGotoStepHint.textContent = j.total
+        ? "0 to " + (j.total - 1) + ", currently on " + j.currentIndex + "."
+        : "No sequence loaded yet.";
+      if (document.activeElement !== idxAutoHome) idxAutoHome.checked = j.autoHomeOnBoot;
+
+      // Shown only when the saved position could not be trusted at boot.
+      if (j.positionKnown === false) {
+        idxResumeBanner.hidden = false;
+        idxResumeBanner.innerHTML =
+          "<b>Position not verified</b>Power was cut while the disc was moving, " +
+          "so it may be parked between nails. Run Find Home, or line nail 0 up " +
+          "by hand and press Set Home, before carrying on. Progress (step " +
+          j.currentIndex + ") has been kept.";
+      } else {
+        idxResumeBanner.hidden = true;
+      }
       syncField(idxStepDelay, j.stepDelay);
       syncField(idxAutoMs, j.autoMs);
       if (document.activeElement !== idxReverseDir) idxReverseDir.checked = (j.dirSign < 0);
@@ -1125,9 +1171,18 @@ window.NailCount = (function(){
   idxAutoBtn.addEventListener("click", () => idxAct(idxAutoOn ? "stop" : "start"));
   idxFindHomeBtn.addEventListener("click", () => idxAct("findhome"));
   feederFeedBtn.addEventListener("click", () => idxAct("feed"));
-  document.getElementById("idxGotoBtn").addEventListener("click", () => {
-    idxAct("goto", document.getElementById("idxGotoVal").value);
+  const idxGotoVal = document.getElementById("idxGotoVal");
+  const idxGotoBtn = document.getElementById("idxGotoBtn");
+  idxGotoBtn.addEventListener("click", () => idxAct("goto", idxGotoVal.value));
+  idxGotoVal.addEventListener("keydown", (e) => { if (e.key === "Enter") idxGotoBtn.click(); });
+
+  // Unlike "goto", this carries progress with it, so the wrap continues from
+  // the chosen step rather than just parking the disc there.
+  idxGotoStepBtn.addEventListener("click", () => {
+    const v = parseInt(idxGotoStepVal.value, 10);
+    if (Number.isFinite(v)) idxAct("gotostep", v);
   });
+  idxGotoStepVal.addEventListener("keydown", (e) => { if (e.key === "Enter") idxGotoStepBtn.click(); });
   // One save for the whole Advanced panel -- motor, feed cycle and servo
   // angles go up together, so there is no half-applied state to reason about.
   async function saveAdvanced() {
@@ -1141,7 +1196,8 @@ window.NailCount = (function(){
       "&feederPulseMs=" + feederPulseMs.value +
       "&feederSettleMs=" + feederSettleMs.value +
       "&feederRecoverMs=" + feederRecoverMs.value +
-      "&feederAutoFeed=" + (feederAutoFeed.checked ? 1 : 0);
+      "&feederAutoFeed=" + (feederAutoFeed.checked ? 1 : 0) +
+      "&autoHomeOnBoot=" + (idxAutoHome.checked ? 1 : 0);
     try {
       await fetch("/config", {
         method: "POST",
@@ -1176,6 +1232,7 @@ window.NailCount = (function(){
 
   // The direction toggle is a switch, not a text field, so it saves at once.
   idxReverseDir.addEventListener("change", saveAdvanced);
+  idxAutoHome.addEventListener("change", saveAdvanced);
 
   // Third view of the shared nail count.
   idxNumNails.addEventListener("input", () => NailCount.set(idxNumNails.value, "machine-settings"));

@@ -97,6 +97,7 @@
 // page into web_page.h.
 // ---------------------------------------------------------------------------
 bool feederBusy();
+void saveState();
 void writeCoils(uint8_t idx);
 void coilsOff();
 long normalizeStep(long s);
@@ -255,6 +256,16 @@ FeederPhase feederPhase = FEED_IDLE;
 unsigned long feederNextAt = 0;
 bool feederPendingAfterMove = false; // fire once the in-flight stepper move completes
 
+// False when the saved position could not be trusted at boot (power was cut
+// mid-move). Cleared by any homing operation.
+bool positionKnown = true;
+// Set at boot when autoHomeOnBoot is on: home first, then drive back to the
+// nail the sequence was left on.
+bool resumeAfterHome = false;
+// Home automatically at power-up and return to the saved nail. Needs the limit
+// switch; without one there is nothing to home against. Persisted.
+bool autoHomeOnBoot = false;
+
 bool feederBusy() { return feederPhase != FEED_IDLE; }
 
 // Homing (non-blocking seek toward the limit switch)
@@ -371,10 +382,19 @@ void startHoming(int8_t dir) {
   lastStepAt = millis();
 }
 
+// State is written twice per nail: once when a move starts (recording where it
+// is headed and that it is in flight) and once when it lands (recording the
+// position it actually reached).
+//
+// Writing only at the start -- which is what earlier versions did -- saved the
+// position from BEFORE the move, so a power cut resumed one nail behind where
+// the disc physically was. Writing only at the end would leave no trace of an
+// interrupted move, and the disc would come back parked somewhere between two
+// nails with the firmware convinced it was on one of them.
 void saveState() {
   File f = LittleFS.open(STATE_FILE, "w");
   if (!f) return;
-  f.printf("%d\n%ld\n", currentIndex, currentStep);
+  f.printf("%d\n%ld\n%ld\n%d\n", currentIndex, currentStep, targetStep, stepping ? 1 : 0);
   f.close();
 }
 
@@ -382,19 +402,33 @@ void loadState() {
   File f = LittleFS.open(STATE_FILE, "r");
   if (!f) return;
   currentIndex = f.readStringUntil('\n').toInt();
-  // normalize: a state file written by older firmware used 4096 steps/rev and
-  // could hold an unbounded step count
-  currentStep = normalizeStep(f.readStringUntil('\n').toInt());
+  // normalize: a state file from older firmware used 4096 steps/rev and could
+  // hold an unbounded step count
+  long savedStep = normalizeStep(f.readStringUntil('\n').toInt());
+  long savedTarget = normalizeStep(readConfigLine(f, savedStep));
+  bool wasMoving = readConfigLine(f, 0) != 0;
   f.close();
+
+  if (wasMoving) {
+    // Power went during a move. The disc stopped somewhere between the two
+    // positions and there is no way to tell where without a reference. Assume
+    // it got there -- moves are short relative to the whole cycle -- but mark
+    // the position unverified so the UI asks for a home before trusting it.
+    currentStep = savedTarget;
+    positionKnown = false;
+  } else {
+    currentStep = savedStep;
+    positionKnown = true;
+  }
 }
 
 void saveConfig() {
   File f = LittleFS.open(CONFIG_FILE, "w");
   if (!f) return;
-  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n",
+  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n",
            numNails, stepDelayMs, (unsigned long)autoAdvanceMs,
            feederRestAngle, feederFeedAngle, feederPulseMs, feederAutoFeed ? 1u : 0u,
-           (int)dirSign, feederSettleMs, feederRecoverMs);
+           (int)dirSign, feederSettleMs, feederRecoverMs, autoHomeOnBoot ? 1u : 0u);
   f.close();
 }
 
@@ -423,6 +457,7 @@ void loadConfig() {
   dirSign = (readConfigLine(f, dirSign) < 0) ? -1 : 1;
   feederSettleMs = (uint16_t)readConfigLine(f, feederSettleMs);
   feederRecoverMs = (uint16_t)readConfigLine(f, feederRecoverMs);
+  autoHomeOnBoot = readConfigLine(f, autoHomeOnBoot ? 1 : 0) != 0;
   f.close();
   if (numNails == 0) numNails = DEF_NUM_NAILS;
   if (stepDelayMs == 0) stepDelayMs = DEF_STEP_DELAY_MS;
@@ -530,6 +565,8 @@ void handleStatus() {
   json += "\"stepsPerRevX100\":" + String(STEPS_PER_REV_X100) + ",";
   json += "\"switchTriggered\":" + String(digitalRead(PIN_LIMIT_SWITCH) == LOW ? "true" : "false") + ",";
   json += "\"homing\":" + String(homing ? "true" : "false") + ",";
+  json += "\"positionKnown\":" + String(positionKnown ? "true" : "false") + ",";
+  json += "\"autoHomeOnBoot\":" + String(autoHomeOnBoot ? "true" : "false") + ",";
   json += "\"homeError\":" + String(homeError ? "true" : "false");
   json += "}";
   sendCorsHeaders();
@@ -570,6 +607,7 @@ void handleConfig() {
   if (server.hasArg("feederPulseMs")) feederPulseMs = (uint16_t)server.arg("feederPulseMs").toInt();
   if (server.hasArg("feederSettleMs")) feederSettleMs = (uint16_t)server.arg("feederSettleMs").toInt();
   if (server.hasArg("feederRecoverMs")) feederRecoverMs = (uint16_t)server.arg("feederRecoverMs").toInt();
+  if (server.hasArg("autoHomeOnBoot")) autoHomeOnBoot = server.arg("autoHomeOnBoot").toInt() != 0;
   if (server.hasArg("feederAutoFeed")) feederAutoFeed = server.arg("feederAutoFeed").toInt() != 0;
   saveConfig();
   if (!feederBusy()) feederServo.write(feederRestAngle); // reflect a new rest angle immediately
@@ -605,11 +643,25 @@ void handleAction() {
     targetStep = 0;
     stepping = false;
     currentIndex = 0;
+    positionKnown = true;   // the operator has told us where zero is
     saveState();
   } else if (cmd == "findhome") {
     // Physically verified homing: slowly seek until the limit switch trips.
     int8_t dir = (server.hasArg("value") && server.arg("value").toInt() < 0) ? -1 : 1;
     startHoming(dir);
+  } else if (cmd == "gotostep") {
+    // Move to a position in the SEQUENCE and take progress with it, so the
+    // wrap carries on from there. "goto" moves the disc without touching
+    // progress.
+    if (!sequence.empty()) {
+      int v = server.arg("value").toInt();
+      if (v < 0) v = 0;
+      if (v >= (int)sequence.size()) v = (int)sequence.size() - 1;
+      currentIndex = v;
+      beginMoveToStep(nailToStep(sequence[currentIndex]));
+      armFeedAfterMove(false);
+      saveState();
+    }
   } else if (cmd == "feed") {
     requestFeed(false);   // manual press: nothing is moving, no settle needed
   } else if (cmd == "goto") {
@@ -666,6 +718,19 @@ void setup() {
   if (currentIndex >= (int)sequence.size()) currentIndex = 0;
   targetStep = currentStep; // start stationary at whatever we last saved as "home"
 
+  Serial.printf("Resumed at step %d of %d, disc at %ld%s\n",
+                currentIndex, (int)sequence.size(), currentStep,
+                positionKnown ? "" : "  (UNVERIFIED -- power was cut mid-move)");
+
+  // Auto-recovery after a power cut. Only worth doing with a limit switch: it
+  // re-establishes an absolute zero, then drives back to the saved nail. The
+  // disc is deliberately NOT set running again -- thread may be loose, and
+  // starting an unattended machine on power-up is a bad default.
+  if (autoHomeOnBoot && !sequence.empty()) {
+    resumeAfterHome = true;
+    startHoming(1);
+  }
+
   feederServo.attach(PIN_FEEDER_SERVO);
   feederServo.write(feederRestAngle);
 
@@ -698,10 +763,21 @@ void loop() {
         currentStep = 0;
         targetStep = 0;
         stepping = false;
-        currentIndex = 0;
-        saveState();
+        positionKnown = true;   // the switch is an absolute reference
         homing = false;
-        coilsOff();
+        if (resumeAfterHome) {
+          // Boot-time recovery: the switch has given us a known zero, so drive
+          // back to the nail the sequence was interrupted on. Progress is kept.
+          resumeAfterHome = false;
+          if (!sequence.empty() && currentIndex < (int)sequence.size()) {
+            beginMoveToStep(nailToStep(sequence[currentIndex]));
+            armFeedAfterMove(false);
+          }
+        } else {
+          currentIndex = 0;   // a hand-requested home also restarts the piece
+        }
+        saveState();
+        if (!stepping) coilsOff();
       } else if (homeStepCount >= HOME_STEP_CAP) {
         homing = false;
         homeError = true;
@@ -729,6 +805,7 @@ void loop() {
         currentStep = normalizeStep(currentStep);
         targetStep = currentStep;
         coilsOff(); // de-energize coils while idle: less heat, no buzzing, no wasted current
+        saveState(); // second write: the disc is here, and no move is pending
         if (feederPendingAfterMove) {
           feederPendingAfterMove = false;
           requestFeed(true);   // settle before feeding: the nail just arrived

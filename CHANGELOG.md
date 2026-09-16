@@ -7,6 +7,57 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.5.0] — 2026-09-16
+
+### Fixed
+
+- **Resume after a power cut came back one nail behind.** `saveState()` was
+  called immediately after `beginMoveToStep()`, at which point `currentStep`
+  still held the position the disc was leaving, not the one it was heading to.
+  The move then completed without saving again, so the file permanently
+  described the previous nail. State is now written twice per nail: once when a
+  move starts, recording the target and that a move is in flight, and once when
+  it lands, recording the position actually reached.
+
+### Added
+
+- **Interrupted-move detection.** If power was cut mid-move, the position is
+  restored as the intended target but flagged unverified, and a banner in the
+  Wrap section asks for a home before carrying on. Progress is kept either way.
+  Any homing operation clears the flag.
+
+- **Find home on power-up** (Advanced → Motor, off by default). With the limit
+  switch fitted, the machine homes against it at boot and drives back to the
+  saved nail, recovering an absolute reference without you touching anything.
+  It deliberately does not start running again — thread may be loose, and
+  starting an unattended machine on power-up is a bad default.
+
+- **Go to step #** in the Wrap section: jumps to a position in the sequence and
+  takes progress with it, so the wrap continues from there. New `gotostep`
+  action on `/action`. It shows the valid range and where you currently are.
+
+- **Go to nail #** promoted out of the collapsed panel into the Wrap section
+  alongside it. This one moves the disc without changing progress — the two are
+  now labelled so the difference is obvious. Both accept Enter.
+
+- `positionKnown` and `autoHomeOnBoot` in the `/status` JSON; `autoHomeOnBoot`
+  persisted as an eleventh line in `/config.txt`.
+
+- A resume line on the serial console at boot, reporting the step, the disc
+  position, and whether it is verified.
+
+### Notes
+
+- The state file gained two lines. Files written by earlier firmware still load
+  — the missing fields fall back to "no move in flight", which is correct for
+  anything that was sitting idle.
+
+- Two small LittleFS writes per nail. The filesystem wear-levels these, but on
+  a several-thousand-chord piece it is a reason not to run the dwell down to
+  near zero.
+
+---
+
 ## [1.4.1] — 2026-09-15
 
 ### Fixed

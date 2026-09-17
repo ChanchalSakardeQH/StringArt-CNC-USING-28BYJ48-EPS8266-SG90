@@ -142,6 +142,13 @@ if you want to wrap by hand from a printout.
 around it, press **Next**, repeat. **Start Auto** advances on a timer instead,
 which works once you have a rhythm.
 
+Under the progress bar you get elapsed time, time remaining, the clock time it
+will finish at, and the measured seconds per nail. These come from timing real
+nail-to-nail cycles rather than adding up the configured phase times — disc
+travel varies with how far apart consecutive nails are, so the configured cycle
+always reads low. It shows "measuring" until it has enough samples, and ignores
+anything over two minutes so a pause does not skew it.
+
 Progress is saved twice per nail — when a move starts and when it lands — so a
 power cut costs you nothing. See [Power cuts](#power-cuts). The disc de-energises between moves — it will not hold
 position against a hard pull, but it also will not cook itself or buzz.
@@ -277,6 +284,28 @@ the sequence and takes progress with it.
 
 ---
 
+## When the wrong nail turns up
+
+On a long run the nail arriving at the feeder eventually stops matching the one
+the machine names. There are two different causes and they need different fixes.
+
+**A constant offset** — it is out by the same amount every time. Open
+*Calibrate the nail position* in the Wrap section, jog until the right nail
+lines up, and tell it which one that is. Fixed for good; your place in the
+sequence is untouched.
+
+**A creep that grows** — a little further out every revolution. That is the
+steps-per-turn figure being wrong, not steps being lost. Spin ten turns, report
+how many nails past the start it finished, and the machine corrects itself. Ten
+turns is enough to measure a 0.05% error.
+
+**Random wandering** that comes back after correcting both — those are missed
+steps, and the fixes are mechanical: raise the step delay, take mass off the
+disc, check nothing binds. *Re-home every N nails* keeps a long run on track,
+but it papers over the problem rather than curing it.
+
+---
+
 ## Which gear ratio
 
 All motor geometry comes from three constants at the top of the sketch:
@@ -408,4 +437,4 @@ and watch it change.
 
 ## Credits
 
-Chanchal Sakarde. All Rights reserved.
+Chanchal Sakarde. All Copy Rights Reserved.

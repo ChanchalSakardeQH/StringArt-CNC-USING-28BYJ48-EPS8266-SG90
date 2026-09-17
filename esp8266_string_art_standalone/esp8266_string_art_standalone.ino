@@ -98,12 +98,15 @@
 // ---------------------------------------------------------------------------
 bool feederBusy();
 bool wrapBusy();
+long stepsPerRev();
+long homeStepCap();
 bool servoBusy();
 void servoGoTo(uint8_t a);
 void servoSnapTo(uint8_t a);
 void serviceServo();
 long wrapSweepSteps();
 void saveState();
+void noteNailDone();
 long wrapLeadSteps();
 void startWrap(uint16_t nail);
 void serviceWrap();
@@ -113,12 +116,14 @@ void writeCoils(uint8_t idx);
 void coilsOff();
 long normalizeStep(long s);
 void beginMoveToStep(long target);
+long nailBaseStep(uint16_t nail);
 long nailToStep(uint16_t nail);
 void requestFeed(bool settleFirst);
 void armFeedAfterMove(bool wantFeed);
 void serviceFeeder();
 void startHoming(int8_t dir);
 void saveState();
+void noteNailDone();
 void loadState();
 void saveConfig();
 long readConfigLine(File &f, long def);
@@ -186,9 +191,20 @@ constexpr long MOTOR_GEAR_RATIO_X100000 = 6400000L;
 
 // Derived: steps per output-shaft revolution, x100 to keep the fractional
 // part without floating point. 32 * 2 * 6400000 / 1000 = 409600 (=4096.00).
-constexpr long STEPS_PER_REV_X100 =
+constexpr long STEPS_PER_REV_X100_DEF =
     MOTOR_INTERNAL_STEPS * MOTOR_STEP_MULT * MOTOR_GEAR_RATIO_X100000 / 1000L;
-constexpr long STEPS_PER_REV = (STEPS_PER_REV_X100 + 50L) / 100L;
+
+// Runtime, not constexpr, because the calibration routine measures the real
+// figure and writes it back. The compiled value is only the starting point:
+// whether your gearbox is 64:1 or the tooth-count 63.68395:1 is something the
+// machine can work out for itself over ten revolutions.
+long stepsPerRevX100 = STEPS_PER_REV_X100_DEF;
+long stepsPerRev() { return (stepsPerRevX100 + 50L) / 100L; }
+
+// Fixed offset between nail numbering and disc position, in half-steps.
+// Re-synced from the UI when the nail at the feeder is not the one the
+// firmware thinks it is -- which is what missed steps eventually cause.
+long nailOffsetSteps = 0;
 
 // Which way the disc turns to present a nail to the fixed feeder.
 //
@@ -355,6 +371,42 @@ bool resumeAfterHome = false;
 // Home automatically at power-up and return to the saved nail. Needs the limit
 // switch; without one there is nothing to home against. Persisted.
 bool autoHomeOnBoot = false;
+// Re-home against the limit switch every N nails, to clear accumulated missed
+// steps on a long run. 0 = off. Needs the switch.
+uint16_t rehomeEvery = 0;
+uint16_t sinceRehome = 0;
+
+// ---------------- Run timing ----------------
+// Measured, not predicted. The theoretical cycle time ignores disc travel,
+// which varies with how far apart consecutive nails are, and ignores however
+// long you actually take between presses in manual mode. An average of real
+// nail-to-nail times is the only estimate worth showing.
+unsigned long lastNailAt = 0;      // when the previous nail was started
+uint32_t avgNailMs = 0;            // exponential moving average of the cycle
+uint32_t runElapsedMs = 0;         // accumulated time with auto running
+unsigned long elapsedTickAt = 0;
+
+// Folds one completed cycle into the average. Wildly short or long samples are
+// dropped: a jog or a pause would otherwise poison the estimate.
+void noteNailDone() {
+  unsigned long now = millis();
+  if (lastNailAt != 0) {
+    unsigned long dt = now - lastNailAt;
+    // 2 minutes is far longer than any real cycle, so anything above it is a
+    // pause rather than a nail and would drag the estimate out badly.
+    if (dt > 200 && dt < 120000UL) {
+      avgNailMs = (avgNailMs == 0) ? (uint32_t)dt
+                                   : (uint32_t)((avgNailMs * 3UL + dt) / 4UL);
+    }
+  }
+  lastNailAt = now;
+}
+
+// Steps-per-revolution calibration, driven from the UI in two steps.
+bool calRunning = false;
+int  calRevs = 0;
+long calStartStep = 0;
+long calRemaining = 0;
 
 bool feederBusy() { return feederPhase != FEED_IDLE; }
 
@@ -364,7 +416,7 @@ bool homeError = false;      // set if the switch never triggered within the saf
 int8_t homeDir = 1;
 long homeStepCount = 0;
 long homeStartStep = 0;      // restored on abort so the position tracker isn't corrupted
-const long HOME_STEP_CAP = STEPS_PER_REV + STEPS_PER_REV / 4; // 1.25 rev safety limit
+long homeStepCap() { return stepsPerRev() + stepsPerRev() / 4; } // 1.25 rev safety limit
 
 // Half-step sequence for a ULN2003-driven unipolar stepper (IN1..IN4)
 const uint8_t HALF_STEP_SEQ[8][4] = {
@@ -393,8 +445,8 @@ void coilsOff() {
 }
 
 long normalizeStep(long s) {
-  s %= STEPS_PER_REV;
-  if (s < 0) s += STEPS_PER_REV;
+  s %= stepsPerRev();
+  if (s < 0) s += stepsPerRev();
   return s;
 }
 
@@ -402,9 +454,9 @@ long normalizeStep(long s) {
 void beginMoveToStep(long target) {
   target = normalizeStep(target);
   long delta = target - currentStep;
-  // wrap into (-STEPS_PER_REV/2, STEPS_PER_REV/2]
-  while (delta > STEPS_PER_REV / 2) delta -= STEPS_PER_REV;
-  while (delta <= -STEPS_PER_REV / 2) delta += STEPS_PER_REV;
+  // wrap into (-stepsPerRev()/2, stepsPerRev()/2]
+  while (delta > stepsPerRev() / 2) delta -= stepsPerRev();
+  while (delta <= -stepsPerRev() / 2) delta += stepsPerRev();
   targetStep = currentStep + delta;
   stepDir = (delta >= 0) ? 1 : -1;
   stepping = (delta != 0);
@@ -412,11 +464,16 @@ void beginMoveToStep(long target) {
 
 // Absolute disc position (in half-steps) that puts `nail` at the feeder.
 // Rounded to the nearest half-step, signed by dirSign, wrapped to one rev.
-long nailToStep(uint16_t nail) {
+// Where nail N sits before the calibration offset is applied.
+long nailBaseStep(uint16_t nail) {
   if (numNails == 0) return 0;
   long n = ((long)nail % (long)numNails + (long)numNails) % (long)numNails;
-  long s = (n * STEPS_PER_REV_X100 + (long)numNails * 50L) / ((long)numNails * 100L);
+  long s = (n * stepsPerRevX100 + (long)numNails * 50L) / ((long)numNails * 100L);
   return normalizeStep((long)dirSign * s);
+}
+
+long nailToStep(uint16_t nail) {
+  return normalizeStep(nailBaseStep(nail) + nailOffsetSteps);
 }
 
 // ---- Feeder servo (non-blocking, phased -- see FeederPhase above) ---------
@@ -451,7 +508,7 @@ void armFeedAfterMove(bool wantFeed) {
 long wrapLeadSteps() {
   if (wrapSteps > 0) return (long)wrapSteps * wrapDir;
   if (numNails == 0) return 0;
-  long half = (STEPS_PER_REV_X100 / (long)numNails / 2 + 50L) / 100L;
+  long half = (stepsPerRevX100 / (long)numNails / 2 + 50L) / 100L;
   if (half < 1) half = 1;
   return half * wrapDir;
 }
@@ -461,7 +518,7 @@ long wrapLeadSteps() {
 long wrapSweepSteps() {
   if (wrapSweep > 0) return (long)wrapSweep * wrapDir;
   if (numNails == 0) return 0;
-  long pitch = (STEPS_PER_REV_X100 / (long)numNails + 50L) / 100L;
+  long pitch = (stepsPerRevX100 / (long)numNails + 50L) / 100L;
   if (pitch < 1) pitch = 1;
   return pitch * wrapDir;
 }
@@ -601,7 +658,8 @@ void startHoming(int8_t dir) {
 void saveState() {
   File f = LittleFS.open(STATE_FILE, "w");
   if (!f) return;
-  f.printf("%d\n%ld\n%ld\n%d\n", currentIndex, currentStep, targetStep, stepping ? 1 : 0);
+  f.printf("%d\n%ld\n%ld\n%d\n%lu\n%lu\n", currentIndex, currentStep, targetStep,
+           stepping ? 1 : 0, (unsigned long)runElapsedMs, (unsigned long)avgNailMs);
   f.close();
 }
 
@@ -614,6 +672,8 @@ void loadState() {
   long savedStep = normalizeStep(f.readStringUntil('\n').toInt());
   long savedTarget = normalizeStep(readConfigLine(f, savedStep));
   bool wasMoving = readConfigLine(f, 0) != 0;
+  runElapsedMs = (uint32_t)readConfigLine(f, 0);
+  avgNailMs = (uint32_t)readConfigLine(f, 0);
   f.close();
 
   if (wasMoving) {
@@ -632,12 +692,13 @@ void loadState() {
 void saveConfig() {
   File f = LittleFS.open(CONFIG_FILE, "w");
   if (!f) return;
-  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n",
+  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%ld\n%ld\n%u\n",
            numNails, stepDelayMs, (unsigned long)autoAdvanceMs,
            feederRestAngle, feederFeedAngle, feederPulseMs, feederAutoFeed ? 1u : 0u,
            (int)dirSign, feederSettleMs, feederRecoverMs, autoHomeOnBoot ? 1u : 0u,
            wrapMode ? 1u : 0u, wrapSteps, (int)wrapDir,
-           wrapSweep, wrapHoldInMs, wrapHoldSweepMs, servoSlewDeg, servoSlewMs);
+           wrapSweep, wrapHoldInMs, wrapHoldSweepMs, servoSlewDeg, servoSlewMs,
+           stepsPerRevX100, nailOffsetSteps, rehomeEvery);
   f.close();
 }
 
@@ -676,6 +737,10 @@ void loadConfig() {
   servoSlewDeg = (uint8_t)readConfigLine(f, servoSlewDeg);
   servoSlewMs = (uint16_t)readConfigLine(f, servoSlewMs);
   if (servoSlewDeg < 1) servoSlewDeg = 1;
+  stepsPerRevX100 = readConfigLine(f, stepsPerRevX100);
+  nailOffsetSteps = readConfigLine(f, nailOffsetSteps);
+  rehomeEvery = (uint16_t)readConfigLine(f, rehomeEvery);
+  if (stepsPerRevX100 < 1000) stepsPerRevX100 = STEPS_PER_REV_X100_DEF;
   f.close();
   if (numNails == 0) numNails = DEF_NUM_NAILS;
   if (stepDelayMs == 0) stepDelayMs = DEF_STEP_DELAY_MS;
@@ -780,7 +845,14 @@ void handleStatus() {
   json += "\"internalSteps\":" + String(MOTOR_INTERNAL_STEPS) + ",";
   json += "\"halfStep\":" + String(MOTOR_HALF_STEP ? "true" : "false") + ",";
   json += "\"gearRatioX100000\":" + String(MOTOR_GEAR_RATIO_X100000) + ",";
-  json += "\"stepsPerRevX100\":" + String(STEPS_PER_REV_X100) + ",";
+  json += "\"stepsPerRevX100\":" + String(stepsPerRevX100) + ",";
+  json += "\"stepsPerRevDefX100\":" + String(STEPS_PER_REV_X100_DEF) + ",";
+  json += "\"nailOffsetSteps\":" + String(nailOffsetSteps) + ",";
+  json += "\"rehomeEvery\":" + String(rehomeEvery) + ",";
+  json += "\"avgNailMs\":" + String(avgNailMs) + ",";
+  json += "\"elapsedMs\":" + String(runElapsedMs) + ",";
+  json += "\"calRunning\":" + String(calRunning ? "true" : "false") + ",";
+  json += "\"hasLimitSwitch\":" + String(PIN_LIMIT_SWITCH >= 0 ? "true" : "false") + ",";
   json += "\"switchTriggered\":" + String(digitalRead(PIN_LIMIT_SWITCH) == LOW ? "true" : "false") + ",";
   json += "\"homing\":" + String(homing ? "true" : "false") + ",";
   json += "\"wrapMode\":" + String(wrapMode ? "true" : "false") + ",";
@@ -829,6 +901,9 @@ void handleConfig() {
     wrapHoldSweepMs = 400;
     servoSlewDeg = 2;
     servoSlewMs = 20;
+    stepsPerRevX100 = STEPS_PER_REV_X100_DEF;
+    nailOffsetSteps = 0;
+    rehomeEvery = 0;
     saveConfig();
     if (!feederBusy() && !wrapBusy()) servoSnapTo(feederRestAngle);
     sendCorsHeaders();
@@ -853,6 +928,7 @@ void handleConfig() {
   if (server.hasArg("wrapHoldSweepMs")) wrapHoldSweepMs = (uint16_t)server.arg("wrapHoldSweepMs").toInt();
   if (server.hasArg("servoSlewDeg")) { servoSlewDeg = (uint8_t)server.arg("servoSlewDeg").toInt(); if (servoSlewDeg < 1) servoSlewDeg = 1; }
   if (server.hasArg("servoSlewMs")) servoSlewMs = (uint16_t)server.arg("servoSlewMs").toInt();
+  if (server.hasArg("rehomeEvery")) rehomeEvery = (uint16_t)server.arg("rehomeEvery").toInt();
   if (server.hasArg("feederAutoFeed")) feederAutoFeed = server.arg("feederAutoFeed").toInt() != 0;
   saveConfig();
   if (!feederBusy() && !wrapBusy()) servoSnapTo(feederRestAngle); // show a new rest angle at once
@@ -871,6 +947,7 @@ void handleAction() {
     // servo's grip; the caller can retry in a few hundred ms.
   } else if (cmd == "next") {
     if (!sequence.empty() && currentIndex + 1 < (int)sequence.size()) {
+      noteNailDone();
       currentIndex++;
       presentNail(sequence[currentIndex], feederAutoFeed);
       saveState();
@@ -889,6 +966,8 @@ void handleAction() {
     targetStep = 0;
     stepping = false;
     currentIndex = 0;
+    runElapsedMs = 0;
+    lastNailAt = 0;
     positionKnown = true;   // the operator has told us where zero is
     saveState();
   } else if (cmd == "findhome") {
@@ -897,6 +976,7 @@ void handleAction() {
     int8_t dir = (server.hasArg("value") && server.arg("value").toInt() < 0) ? -1 : 1;
     startHoming(dir);
   } else if (cmd == "gotostep") {
+    lastNailAt = 0;
     // Move to a position in the SEQUENCE and take progress with it, so the
     // wrap carries on from there. "goto" moves the disc without touching
     // progress.
@@ -909,6 +989,49 @@ void handleAction() {
       armFeedAfterMove(false);
       saveState();
     }
+  } else if (cmd == "jog") {
+    // Nudge the disc without touching the nail numbering or progress. Used to
+    // line a nail up with the feeder before re-syncing.
+    long d = server.arg("value").toInt();
+    beginMoveToStep(normalizeStep(currentStep + d));
+    saveState();
+  } else if (cmd == "setnail") {
+    // "The nail at the feeder is actually N." Solves for the offset that makes
+    // that true, so every future move lands right. Progress is untouched --
+    // this corrects where the disc is, not where you are in the sequence.
+    long n = server.arg("value").toInt();
+    nailOffsetSteps = normalizeStep(currentStep - nailBaseStep((uint16_t)n));
+    saveConfig();
+    saveState();
+  } else if (cmd == "calmove") {
+    // Step one of measuring the real steps-per-revolution: drive a whole
+    // number of turns and stop. Whatever nail comes back to the feeder tells
+    // us how wrong our figure is.
+    calRevs = server.arg("value").toInt();
+    if (calRevs < 1) calRevs = 1;
+    if (calRevs > 50) calRevs = 50;
+    calStartStep = currentStep;
+    calRunning = true;
+    beginMoveToStep(currentStep);          // land exactly where we are
+    calRemaining = calRevs * stepsPerRev();
+  } else if (cmd == "calreport") {
+    // Step two: you tell it how many nails past (or short of) the start the
+    // disc actually finished, and it corrects steps-per-revolution.
+    long errNails = server.arg("value").toInt();
+    if (calRevs > 0 && numNails > 0 && errNails != 0) {
+      // commanded = calRevs turns; actual = calRevs + errNails/numNails turns
+      long num = (long)calRevs * (long)numNails * 100L;
+      long den = (long)calRevs * (long)numNails + errNails;
+      if (den > 0) {
+        long fresh = (stepsPerRevX100 * num / 100L) / den;
+        if (fresh > stepsPerRevX100 / 2 && fresh < stepsPerRevX100 * 2) {
+          stepsPerRevX100 = fresh;
+        }
+      }
+    }
+    calRunning = false;
+    calRevs = 0;
+    saveConfig();
   } else if (cmd == "wraptest") {
     // One wrap cycle on the nail currently at the feeder, for tuning the
     // overshoot and servo angles without committing to a run.
@@ -925,6 +1048,7 @@ void handleAction() {
     lastAutoAdvanceAt = millis();
   } else if (cmd == "stop") {
     abortWrap();
+    lastNailAt = 0;   // don't fold the pause into the per-nail average
     autoRunning = false;
   }
   sendCorsHeaders();
@@ -1009,7 +1133,7 @@ void loop() {
 
   if (homing) {
     // Slow open-loop seek: step one half-step at a time until the limit
-    // switch trips, or we give up after HOME_STEP_CAP half-steps (broken
+    // switch trips, or we give up after homeStepCap() half-steps (broken
     // wiring, a switch that never closes, etc.) rather than spin forever.
     if (millis() - lastStepAt >= stepDelayMs) {
       lastStepAt = millis();
@@ -1032,7 +1156,7 @@ void loop() {
         }
         saveState();
         if (!stepping) coilsOff();
-      } else if (homeStepCount >= HOME_STEP_CAP) {
+      } else if (homeStepCount >= homeStepCap()) {
         homing = false;
         homeError = true;
         currentStep = homeStartStep; // don't leave the position tracker corrupted
@@ -1053,7 +1177,7 @@ void loop() {
       writeCoils(halfStepIdx);
       if (currentStep == targetStep) {
         stepping = false;
-        // Snap the tracker back into 0..STEPS_PER_REV-1. Every move is planned
+        // Snap the tracker back into 0..stepsPerRev()-1. Every move is planned
         // from an absolute target, so rounding error cannot accumulate across
         // thousands of chords.
         currentStep = normalizeStep(currentStep);
@@ -1071,11 +1195,21 @@ void loop() {
 
     // Optional hands-free auto-advance. Waits for the feeder as well as the
     // stepper, so the disc never starts turning with thread still being fed.
-    if (autoRunning && !stepping && !feederBusy() && !wrapBusy() && !sequence.empty() &&
+    if (autoRunning && !stepping && !feederBusy() && !wrapBusy() && !calRunning &&
+        !sequence.empty() &&
         currentIndex + 1 < (int)sequence.size() &&
         millis() - lastAutoAdvanceAt >= autoAdvanceMs) {
+      noteNailDone();
       currentIndex++;
-      presentNail(sequence[currentIndex], feederAutoFeed);
+      // Periodic re-home wipes accumulated missed steps. Progress is kept, so
+      // it picks straight back up on the same chord.
+      if (rehomeEvery > 0 && PIN_LIMIT_SWITCH >= 0 && ++sinceRehome >= rehomeEvery) {
+        sinceRehome = 0;
+        resumeAfterHome = true;
+        startHoming(1);
+      } else {
+        presentNail(sequence[currentIndex], feederAutoFeed);
+      }
       saveState();
       if (currentIndex + 1 >= (int)sequence.size()) autoRunning = false;
     }
@@ -1083,6 +1217,21 @@ void loop() {
 
   // Feeder servo: advances the settle -> pulse -> recover cycle
   serviceFeeder();
+  // Run clock: only ticks while auto is running, so pauses do not inflate it.
+  {
+    unsigned long now = millis();
+    if (autoRunning && elapsedTickAt != 0) runElapsedMs += (uint32_t)(now - elapsedTickAt);
+    elapsedTickAt = now;
+  }
+
+  // Calibration turns: a long run of whole revolutions, a revolution at a time
+  // so each move stays inside one wrap of the step counter.
+  if (calRunning && !stepping && calRemaining > 0) {
+    long chunk = calRemaining > stepsPerRev() / 2 ? stepsPerRev() / 2 : calRemaining;
+    calRemaining -= chunk;
+    beginMoveToStep(normalizeStep(currentStep + chunk * dirSign));
+  }
+
   // Wrap sequencer: interleaves disc moves and servo swings
   serviceWrap();
   // Servo slew: walks the arm toward its target one increment at a time

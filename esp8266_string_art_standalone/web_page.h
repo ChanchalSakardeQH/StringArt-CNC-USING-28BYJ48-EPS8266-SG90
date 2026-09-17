@@ -201,6 +201,15 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   details summary{ cursor:pointer; font-size:.82rem; color:var(--text-dim); font-weight:600; margin-bottom:10px; }
   details .field{ margin-bottom:10px; }
 
+  .eta-grid{
+    display:grid; grid-template-columns:1fr 1fr; gap:6px 12px;
+    margin:2px 0 14px; font-family:"IBM Plex Mono",monospace;
+  }
+  .eta-grid > div{ display:flex; flex-direction:column; }
+  .eta-k{ font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--text-dim); }
+  .eta-v{ font-size:.94rem; color:var(--text); }
+  .jog-row{ display:flex; gap:5px; }
+  .jog-row button{ flex:1; width:auto; padding:9px 0; margin:0; font-size:.82rem; }
   .resume-banner{
     font-size:.78rem; line-height:1.5; border-radius:8px; padding:9px 11px;
     border:1px solid var(--warn); border-left-width:3px;
@@ -312,6 +321,12 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     <div class="nail-readout" id="idxNailNum">&mdash;</div>
     <div class="idx-sub" id="idxProgressText">step -- / --</div>
     <progress id="idxBar" value="0" max="100"></progress>
+    <div class="eta-grid" id="idxEta" hidden>
+      <div><span class="eta-k">elapsed</span><span class="eta-v" id="etaElapsed">--</span></div>
+      <div><span class="eta-k">remaining</span><span class="eta-v" id="etaLeft">--</span></div>
+      <div><span class="eta-k">finishes</span><span class="eta-v" id="etaClock">--</span></div>
+      <div><span class="eta-k">per nail</span><span class="eta-v" id="etaPer">--</span></div>
+    </div>
 
     <div class="btn-pair">
       <button class="secondary" id="idxPrevBtn">&larr; Prev</button>
@@ -343,6 +358,67 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       </div>
       <div class="stat-line">Rotates the disc without changing where you are in the sequence.</div>
     </div>
+
+    <details>
+      <summary>Calibrate the nail position</summary>
+      <p class="idx-sub" style="text-align:left;margin-top:8px">
+        Use this when the nail arriving at the feeder is not the one the machine
+        names. Jog until the right nail lines up, then tell it which one that is.
+        Your place in the sequence is not affected.
+      </p>
+
+      <div class="field">
+        <label>Jog the disc <span class="val">nothing else changes</span></label>
+        <div class="jog-row">
+          <button class="ghost" data-jog="-10">&minus;10</button>
+          <button class="ghost" data-jog="-3">&minus;3</button>
+          <button class="ghost" data-jog="-1">&minus;1</button>
+          <button class="ghost" data-jog="1">+1</button>
+          <button class="ghost" data-jog="3">+3</button>
+          <button class="ghost" data-jog="10">+10</button>
+        </div>
+        <div class="stat-line" id="calJogUnit">&mdash;</div>
+      </div>
+
+      <div class="field">
+        <label>The nail at the feeder is actually #</label>
+        <div class="btn-pair">
+          <input id="calNailVal" type="number" min="0">
+          <button class="secondary" id="calSetBtn" style="width:auto;flex:none;padding:8px 16px">Set</button>
+        </div>
+        <div class="stat-line" id="calOffsetText">&mdash;</div>
+      </div>
+
+      <hr>
+
+      <p class="idx-sub" style="text-align:left">
+        If it creeps a little further out every revolution, the steps-per-turn
+        figure is wrong rather than steps being lost. This measures it.
+      </p>
+      <div class="field">
+        <label>Spin this many full turns</label>
+        <div class="btn-pair">
+          <input id="calRevsVal" type="number" min="1" max="50" value="10">
+          <button class="ghost" id="calMoveBtn" style="width:auto;flex:none;padding:8px 16px">Spin</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>It finished this many nails past the start <span class="val">negative = short</span></label>
+        <div class="btn-pair">
+          <input id="calErrVal" type="number" value="0">
+          <button class="secondary" id="calReportBtn" style="width:auto;flex:none;padding:8px 16px">Correct</button>
+        </div>
+      </div>
+      <div class="sync-box" id="calStepsText">&mdash;</div>
+
+      <hr>
+
+      <div class="field">
+        <label>Re-home every N nails <span class="val">0 = off</span></label>
+        <input id="calRehome" type="number" min="0" max="2000" step="10">
+      </div>
+      <div class="stat-line" id="calRehomeText">&mdash;</div>
+    </details>
 
     <hr>
 
@@ -1073,6 +1149,40 @@ window.NailCount = (function(){
 
   const idxNailNum = document.getElementById("idxNailNum");
   const idxProgressText = document.getElementById("idxProgressText");
+  const idxEta = document.getElementById("idxEta");
+  const etaElapsed = document.getElementById("etaElapsed");
+  const etaLeft = document.getElementById("etaLeft");
+  const etaClock = document.getElementById("etaClock");
+  const etaPer = document.getElementById("etaPer");
+
+  function hms(ms){
+    if (!isFinite(ms) || ms < 0) return "--";
+    const t = Math.round(ms / 1000);
+    const h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = t % 60;
+    return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(s).padStart(2, "0");
+  }
+
+  function renderEta(j){
+    const left = Math.max(0, j.total - j.currentIndex - 1);
+    if (!j.total) { idxEta.hidden = true; return; }
+    idxEta.hidden = false;
+    etaElapsed.textContent = hms(j.elapsedMs);
+    if (!j.avgNailMs) {
+      // Nothing measured yet. Guessing from the configured timings would
+      // ignore disc travel and read low, so say so instead.
+      etaLeft.textContent = "measuring";
+      etaClock.textContent = "--";
+      etaPer.textContent = left + " nails left";
+      return;
+    }
+    const remain = left * j.avgNailMs;
+    etaLeft.textContent = hms(remain);
+    const done = new Date(Date.now() + remain);
+    const sameDay = done.toDateString() === new Date().toDateString();
+    etaClock.textContent = done.toTimeString().slice(0, 5) +
+      (sameDay ? "" : " +" + Math.ceil((done - new Date()) / 86400000) + "d");
+    etaPer.textContent = (j.avgNailMs / 1000).toFixed(1) + " s";
+  }
   const idxBar = document.getElementById("idxBar");
   const idxAutoBtn = document.getElementById("idxAutoBtn");
   const idxNumNails = document.getElementById("idxNumNails");
@@ -1088,6 +1198,17 @@ window.NailCount = (function(){
   const idxGotoStepHint = document.getElementById("idxGotoStepHint");
   const idxResumeBanner = document.getElementById("idxResumeBanner");
   const idxAutoHome = document.getElementById("idxAutoHome");
+  const calJogUnit = document.getElementById("calJogUnit");
+  const calNailVal = document.getElementById("calNailVal");
+  const calSetBtn = document.getElementById("calSetBtn");
+  const calOffsetText = document.getElementById("calOffsetText");
+  const calRevsVal = document.getElementById("calRevsVal");
+  const calMoveBtn = document.getElementById("calMoveBtn");
+  const calErrVal = document.getElementById("calErrVal");
+  const calReportBtn = document.getElementById("calReportBtn");
+  const calStepsText = document.getElementById("calStepsText");
+  const calRehome = document.getElementById("calRehome");
+  const calRehomeText = document.getElementById("calRehomeText");
   const wrapMode = document.getElementById("wrapMode");
   const wrapSteps = document.getElementById("wrapSteps");
   const wrapDirFlip = document.getElementById("wrapDirFlip");
@@ -1121,7 +1242,7 @@ window.NailCount = (function(){
   const advFields = [idxNumNails, idxStepDelay, idxAutoMs, feederRestAngle,
                      feederFeedAngle, feederPulseMs, feederSettleMs, feederRecoverMs,
                      wrapSteps, wrapSweep, wrapHoldInMs, wrapHoldSweepMs,
-                     servoSlewDeg, servoSlewMs];
+                     servoSlewDeg, servoSlewMs, calRehome];
   const dirty = new Set();
   advFields.forEach(f => f.addEventListener("input", () => {
     dirty.add(f.id);
@@ -1189,6 +1310,8 @@ window.NailCount = (function(){
       syncField(wrapHoldSweepMs, j.wrapHoldSweepMs);
       syncField(servoSlewDeg, j.servoSlewDeg);
       syncField(servoSlewMs, j.servoSlewMs);
+      syncField(calRehome, j.rehomeEvery);
+      renderCal(j);
       renderWrapBreakdown(j);
 
       // Shown only when the saved position could not be trusted at boot.
@@ -1202,6 +1325,7 @@ window.NailCount = (function(){
       } else {
         idxResumeBanner.hidden = true;
       }
+      renderEta(j);
       syncField(idxStepDelay, j.stepDelay);
       syncField(idxAutoMs, j.autoMs);
       if (document.activeElement !== idxReverseDir) idxReverseDir.checked = (j.dirSign < 0);
@@ -1246,6 +1370,64 @@ window.NailCount = (function(){
     if (Number.isFinite(v)) idxAct("gotostep", v);
   });
   idxGotoStepVal.addEventListener("keydown", (e) => { if (e.key === "Enter") idxGotoStepBtn.click(); });
+
+  // ---- calibration ------------------------------------------------------
+  let stepsPerNail = 1;
+
+  // Jog moves whole nails where that is sensible, and single steps when the
+  // nails are coarse enough that one nail would overshoot what you are trying
+  // to line up.
+  document.querySelectorAll("[data-jog]").forEach(b => {
+    b.addEventListener("click", () => {
+      const n = parseInt(b.dataset.jog, 10);
+      idxAct("jog", Math.round(n * stepsPerNail));
+    });
+  });
+
+  calSetBtn.addEventListener("click", () => {
+    const v = parseInt(calNailVal.value, 10);
+    if (Number.isFinite(v)) idxAct("setnail", v);
+  });
+  calMoveBtn.addEventListener("click", () => {
+    const v = parseInt(calRevsVal.value, 10) || 10;
+    idxAct("calmove", v);
+  });
+  calReportBtn.addEventListener("click", () => {
+    const v = parseInt(calErrVal.value, 10);
+    if (Number.isFinite(v)) idxAct("calreport", v);
+  });
+
+  function renderCal(j){
+    stepsPerNail = (j.stepsPerRevX100 / 100) / j.numNails;
+    calJogUnit.textContent =
+      "One press = one nail (" + stepsPerNail.toFixed(1) + " steps, " +
+      (360 / j.numNails).toFixed(2) + "\u00b0).";
+
+    const offNails = j.nailOffsetSteps / stepsPerNail;
+    calOffsetText.textContent = j.nailOffsetSteps === 0
+      ? "No correction applied."
+      : "Correction: " + j.nailOffsetSteps + " steps (" +
+        offNails.toFixed(2) + " nails).";
+
+    const now = j.stepsPerRevX100 / 100;
+    const def = j.stepsPerRevDefX100 / 100;
+    const drift = (now - def) / def * 100;
+    calStepsText.className = "sync-box " + (Math.abs(drift) > 3 ? "approx" : "exact");
+    calStepsText.innerHTML =
+      "<b>" + now.toFixed(2) + "</b> steps per turn " +
+      "<span class=\"dim\">(compiled default " + def.toFixed(2) + ", " +
+      (drift >= 0 ? "+" : "") + drift.toFixed(2) + "%)</span><br>" +
+      "<span class=\"dim\">One nail out after " +
+      (Math.abs(drift) < 0.001 ? "\u221e" :
+        Math.round(100 / Math.abs(drift) / j.numNails * 100) / 100 + " turns") +
+      " of accumulated error at this figure.</span>";
+
+    calRehomeText.textContent = !j.hasLimitSwitch
+      ? "No limit switch fitted, so this cannot run."
+      : (j.rehomeEvery > 0
+        ? "Re-homes every " + j.rehomeEvery + " nails, keeping your place."
+        : "Off. On a long run this is the only thing that clears missed steps.");
+  }
   // One save for the whole Advanced panel -- motor, feed cycle and servo
   // angles go up together, so there is no half-applied state to reason about.
   async function saveAdvanced() {
@@ -1268,7 +1450,8 @@ window.NailCount = (function(){
       "&wrapHoldInMs=" + wrapHoldInMs.value +
       "&wrapHoldSweepMs=" + wrapHoldSweepMs.value +
       "&servoSlewDeg=" + servoSlewDeg.value +
-      "&servoSlewMs=" + servoSlewMs.value;
+      "&servoSlewMs=" + servoSlewMs.value +
+      "&rehomeEvery=" + calRehome.value;
     try {
       await fetch("/config", {
         method: "POST",

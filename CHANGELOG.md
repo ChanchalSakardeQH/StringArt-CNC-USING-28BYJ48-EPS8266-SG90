@@ -2,8 +2,76 @@
 
 All notable changes to the ESP8266 String Art Indexer are recorded here.
 
-Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning follows [Semantic Versioning](https://semver.org/).
+---
+
+## [1.8.0] — 2026-09-17
+
+### Added
+
+- **Run clock and ETA** under the progress bar in the Wrap section: elapsed
+  time, remaining time, the clock time it will finish at, and the measured
+  seconds per nail.
+
+  The estimate is **measured, not predicted**. The configured feed cycle time
+  ignores disc travel, which varies with how far apart consecutive nails are,
+  and ignores however long you actually take between presses in manual mode.
+  The firmware keeps an exponential moving average of real nail-to-nail times
+  instead, and the UI says "measuring" rather than guessing until it has data.
+
+- Samples outside 0.2–120 s are dropped, and the timestamp is cleared on Stop
+  and on Go to step, so a pause is never folded into the average.
+
+- The run clock only ticks while auto is running, so it measures machine time
+  rather than wall time.
+
+- `avgNailMs` and `elapsedMs` in `/status`, both persisted in `/state.txt`, so
+  the estimate survives a reboot mid-piece instead of restarting from nothing.
+
+---
+
+## [1.7.0] — 2026-09-16
+
+### Added
+
+- **Calibrate the nail position**, in the Wrap section. Jog the disc a nail at
+  a time until the right one lines up with the feeder, then say which one it
+  is. The firmware solves for the offset that makes that true and applies it to
+  every future move. Your place in the sequence is untouched — this corrects
+  where the *disc* is, not where you are in the *chord list*.
+
+- **Steps-per-turn calibration.** Spin a set number of whole turns, report how
+  many nails past or short of the start it finished, and the firmware corrects
+  its steps-per-revolution figure. This separates the two causes of drift:
+  a constant creep every revolution is a wrong step count, random wandering is
+  missed steps.
+
+  It also settles the 64:1 vs 63.68395:1 question empirically. A disc that
+  finishes 18 nails short over 10 turns measures 4075.6 steps — which is the
+  tooth-count ratio, found by measurement rather than assumed.
+
+- **Re-home every N nails** (needs the limit switch). The only thing that
+  actually clears missed steps on a long run. Progress is kept, so it resumes
+  on the same chord.
+
+- `stepsPerRevX100`, `stepsPerRevDefX100`, `nailOffsetSteps`, `rehomeEvery`,
+  `calRunning` and `hasLimitSwitch` in `/status`; new `jog`, `setnail`,
+  `calmove` and `calreport` actions. Three more lines in `/config.txt`.
+
+### Changed
+
+- **Steps per revolution is now a runtime value**, not a compile-time constant,
+  so calibration can write it back. `nailToStep()` splits into `nailBaseStep()`
+  plus the calibration offset, which is what lets the re-sync solve for it.
+
+- Auto-advance waits for `calRunning`, so a calibration spin cannot be
+  interrupted by the sequence.
+
+### Notes
+
+- Re-sync corrects a *constant* error. If the disc keeps wandering off after
+  you have corrected it, that is missed steps, and the fixes are mechanical:
+  raise the step delay, reduce the disc's inertia, check nothing is binding.
+  Re-homing periodically papers over it; it does not cure it.
 
 ---
 

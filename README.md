@@ -135,6 +135,12 @@ count and line weight, then let it solve. The preview builds up as it runs.
 Chord count is the main quality dial — more chords means a darker, more
 detailed result and a much longer wrap.
 
+**Print a card.** *Greeting card (A4 PDF)* puts the photo and the finished art
+on one A4 landscape sheet, folded down the middle — art and title on the cover,
+photo and your message inside. Print at 100% scale, fit-to-page off. The PDF is
+written in the page itself rather than with a library, so it works with no
+internet connection.
+
 **Send.** Push the sequence to the machine, or download the step list as text
 if you want to wrap by hand from a printout.
 
@@ -437,4 +443,4 @@ and watch it change.
 
 ## Credits
 
-Chanchal Sakarde. All Copy Rights Reserved.
+Chanchal Sakarde. All Copyrights reserved.

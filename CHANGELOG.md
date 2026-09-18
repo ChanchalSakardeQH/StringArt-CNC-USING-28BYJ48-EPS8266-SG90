@@ -4,6 +4,37 @@ All notable changes to the ESP8266 String Art Indexer are recorded here.
 
 ---
 
+## [1.9.0] — 2026-09-17
+
+### Added
+
+- **Greeting card PDF.** Under the Design section: your cropped photo and the
+  generated string art on one A4 landscape sheet, folded down the middle, with
+  an optional title and message. Downloads as a real PDF.
+
+  Written from scratch rather than with a library. A PDF can carry a JPEG's
+  bytes verbatim as a DCTDecode stream, so the whole writer is about sixty
+  lines; jsPDF would do the same job for roughly 300 KB of PROGMEM, which the
+  ESP8266 has not got to spare.
+
+  The output was verified against a PDF parser: A4 landscape mediabox
+  (842 × 595 pt = 297 × 210 mm) at an effective 150 dpi.
+
+- Layout notes: a landscape sheet folded down the middle keeps both halves
+  upright, so nothing needs rotating. The right half is the cover — string art
+  with the title beneath and a nails/chords credit line. The left half is the
+  inside — the source photo, circular-cropped to echo the nail ring, with the
+  message wrapped below it. The fold line is optional.
+
+### Notes
+
+- The card canvas is 1754 × 1240 px, about 9 MB in the browser. Fine on a phone,
+  but it is built only when you press the button, not kept around.
+
+- Print at 100% scale with fit-to-page off, as with the base template.
+
+---
+
 ## [1.8.0] — 2026-09-17
 
 ### Added

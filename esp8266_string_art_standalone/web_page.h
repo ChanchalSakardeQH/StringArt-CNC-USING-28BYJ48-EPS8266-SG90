@@ -133,10 +133,12 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     font-size:.78rem; color:var(--text-dim); margin-bottom:5px; font-weight:600;
   }
   .field label .val{ font-family:"IBM Plex Mono",monospace; color:var(--text); font-weight:600; }
-  input[type=number], input[type=text]{
+  input[type=number], input[type=text], textarea{
     width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:7px;
     background:var(--bg); color:var(--text); font-family:"IBM Plex Mono",monospace; font-size:.9rem;
+    box-sizing:border-box;
   }
+  textarea{ resize:vertical; line-height:1.45; }
   input[type=range]{ width:100%; accent-color:var(--copper); }
 
   .fileBtn{
@@ -312,6 +314,28 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       <button class="secondary" id="downloadStepsBtn" disabled>Download steps</button>
       <button class="secondary" id="downloadSvgBtn" disabled>Download SVG</button>
     </div>
+
+    <details>
+      <summary>Greeting card (A4 PDF)</summary>
+      <p class="idx-sub" style="text-align:left;margin-top:8px">
+        Your photo and the string art side by side on one A4 landscape sheet,
+        folded down the middle. Print at 100% scale.
+      </p>
+      <div class="field">
+        <label>Title <span class="val">under the art</span></label>
+        <input id="cardTitle" type="text" maxlength="40" placeholder="optional">
+      </div>
+      <div class="field">
+        <label>Message <span class="val">inside</span></label>
+        <textarea id="cardMsg" rows="3" maxlength="240" placeholder="optional"></textarea>
+      </div>
+      <div class="switch-row">
+        <span>Print the fold line</span>
+        <label class="switch"><input type="checkbox" id="cardFold" checked><span class="slider"></span></label>
+      </div>
+      <button class="primary" id="cardPdfBtn" disabled style="margin-bottom:0">Download card PDF</button>
+      <div class="stat-line" id="cardMsgLine">&mdash;</div>
+    </details>
     <button class="primary" id="sendBtn" disabled>Send to this machine</button>
     <div class="msg" id="sendMsg"></div>
 
@@ -1005,6 +1029,7 @@ window.NailCount = (function(){
     lastResult = null;
     downloadStepsBtn.disabled = true;
     downloadSvgBtn.disabled = true;
+    cardPdfBtn.disabled = true;
     sendBtn.disabled = true;
   });
 
@@ -1025,6 +1050,7 @@ window.NailCount = (function(){
     generateBtn.disabled = true;
     downloadStepsBtn.disabled = true;
     downloadSvgBtn.disabled = true;
+    cardPdfBtn.disabled = true;
     sendBtn.disabled = true;
 
     const numPins = NailCount.get();
@@ -1089,6 +1115,7 @@ window.NailCount = (function(){
     statLine.textContent = "pins: " + numPins + "    chords: " + (sequence.length - 1);
     downloadStepsBtn.disabled = false;
     downloadSvgBtn.disabled = false;
+    cardPdfBtn.disabled = false;
     sendBtn.disabled = false;
   }
 
@@ -1104,6 +1131,149 @@ window.NailCount = (function(){
   downloadStepsBtn.addEventListener("click", () => {
     if (!lastResult) return;
     triggerDownload("string_art_steps.txt", C.formatStepsText(lastResult.sequence), "text/plain;charset=utf-8");
+  });
+
+  // ---- Greeting card (A4 landscape PDF) ---------------------------------
+  //
+  // A PDF can carry a JPEG's bytes verbatim as a DCTDecode stream, so the whole
+  // writer is about sixty lines. jsPDF would do the same job for roughly 300 KB
+  // of PROGMEM, which the ESP8266 has not got to spare.
+
+  const cardTitle = document.getElementById("cardTitle");
+  const cardMsg = document.getElementById("cardMsg");
+  const cardFold = document.getElementById("cardFold");
+  const cardPdfBtn = document.getElementById("cardPdfBtn");
+  const cardMsgLine = document.getElementById("cardMsgLine");
+
+  const CARD_DPI = 150;                       // 1754 x 1240 px, ~9 MB of canvas
+  const A4_W_PT = 842, A4_H_PT = 595;         // A4 landscape in PDF points
+
+  function drawCard() {
+    const W = Math.round(297 / 25.4 * CARD_DPI);
+    const H = Math.round(210 / 25.4 * CARD_DPI);
+    const c = document.createElement("canvas");
+    c.width = W; c.height = H;
+    const g = c.getContext("2d");
+
+    g.fillStyle = "#ffffff";
+    g.fillRect(0, 0, W, H);
+
+    const half = W / 2;
+    // A landscape sheet folded down the middle keeps both halves upright, so
+    // nothing needs rotating: right half is the cover, left half the inside.
+    if (cardFold.checked) {
+      g.save();
+      g.strokeStyle = "#d8d2c8"; g.lineWidth = 1.5; g.setLineDash([9, 9]);
+      g.beginPath(); g.moveTo(half, 40); g.lineTo(half, H - 40); g.stroke();
+      g.restore();
+    }
+
+    // --- cover: the string art ---
+    const artSide = Math.min(half - 150, H - 300);
+    const ax = half + (half - artSide) / 2;
+    const ay = (H - artSide) / 2 - 40;
+    g.drawImage(canvas, ax, ay, artSide, artSide);
+
+    const title = cardTitle.value.trim();
+    g.fillStyle = "#1a1a1a";
+    g.textAlign = "center";
+    if (title) {
+      g.font = "600 " + Math.round(CARD_DPI * 0.26) + "px Georgia, 'Times New Roman', serif";
+      g.fillText(title, half + half / 2, ay + artSide + CARD_DPI * 0.52, half - 120);
+    }
+    if (lastResult) {
+      g.fillStyle = "#8a8378";
+      g.font = Math.round(CARD_DPI * 0.10) + "px Georgia, serif";
+      g.fillText(lastResult.numPins + " nails  \u00b7  " +
+                 (lastResult.sequence.length - 1) + " chords",
+                 half + half / 2, H - CARD_DPI * 0.42);
+    }
+
+    // --- inside: the photo it came from, and the message ---
+    if (croppedCanvas) {
+      const ps = Math.min(half - 320, H - 560);
+      const px = (half - ps) / 2, py = CARD_DPI * 0.75;
+      g.save();
+      g.beginPath(); g.arc(px + ps / 2, py + ps / 2, ps / 2, 0, Math.PI * 2);
+      g.clip();
+      g.drawImage(croppedCanvas, px, py, ps, ps);
+      g.restore();
+      g.strokeStyle = "#ddd6cb"; g.lineWidth = 2;
+      g.beginPath(); g.arc(px + ps / 2, py + ps / 2, ps / 2, 0, Math.PI * 2); g.stroke();
+
+      const msg = cardMsg.value.trim();
+      if (msg) {
+        g.fillStyle = "#2a2a2a";
+        g.font = Math.round(CARD_DPI * 0.155) + "px Georgia, 'Times New Roman', serif";
+        const maxW = half - 260;
+        let y = py + ps + CARD_DPI * 0.55;
+        for (const para of msg.split("\n")) {
+          let line = "";
+          for (const word of para.split(/\s+/)) {
+            const test = line ? line + " " + word : word;
+            if (g.measureText(test).width > maxW && line) {
+              g.fillText(line, half / 2, y); y += CARD_DPI * 0.24; line = word;
+            } else { line = test; }
+          }
+          if (line) { g.fillText(line, half / 2, y); y += CARD_DPI * 0.24; }
+        }
+      }
+    }
+    return c;
+  }
+
+  function jpegToPdf(jpeg, imgW, imgH, pageW, pageH) {
+    const enc = (t) => new TextEncoder().encode(t);
+    const parts = []; const offs = []; let len = 0;
+    const push = (u8) => { parts.push(u8); len += u8.length; };
+    const str = (t) => push(enc(t));
+    const mark = (n) => { offs[n] = len; };
+
+    push(new Uint8Array([0x25,0x50,0x44,0x46,0x2d,0x31,0x2e,0x34,0x0a,
+                         0x25,0xe2,0xe3,0xcf,0xd3,0x0a]));
+    mark(1); str("1 0 obj\n<</Type/Catalog/Pages 2 0 R>>\nendobj\n");
+    mark(2); str("2 0 obj\n<</Type/Pages/Kids[3 0 R]/Count 1>>\nendobj\n");
+    mark(3); str("3 0 obj\n<</Type/Page/Parent 2 0 R/MediaBox[0 0 " + pageW + " " +
+                 pageH + "]/Resources<</XObject<</Im0 4 0 R>>>>/Contents 5 0 R>>\nendobj\n");
+    mark(4); str("4 0 obj\n<</Type/XObject/Subtype/Image/Width " + imgW +
+                 "/Height " + imgH + "/ColorSpace/DeviceRGB/BitsPerComponent 8" +
+                 "/Filter/DCTDecode/Length " + jpeg.length + ">>\nstream\n");
+    push(jpeg);
+    str("\nendstream\nendobj\n");
+    const content = "q " + pageW + " 0 0 " + pageH + " 0 0 cm /Im0 Do Q\n";
+    mark(5); str("5 0 obj\n<</Length " + content.length + ">>\nstream\n" +
+                 content + "endstream\nendobj\n");
+
+    const xref = len;
+    let x = "xref\n0 6\n0000000000 65535 f \n";
+    for (let i = 1; i <= 5; i++) x += String(offs[i]).padStart(10, "0") + " 00000 n \n";
+    x += "trailer\n<</Size 6/Root 1 0 R>>\nstartxref\n" + xref + "\n%%EOF\n";
+    str(x);
+
+    const out = new Uint8Array(len); let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.length; }
+    return out;
+  }
+
+  cardPdfBtn.addEventListener("click", async () => {
+    if (!lastResult) return;
+    cardPdfBtn.disabled = true;
+    const was = cardPdfBtn.textContent;
+    cardPdfBtn.textContent = "Building\u2026";
+    try {
+      const c = drawCard();
+      const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.92));
+      const jpeg = new Uint8Array(await blob.arrayBuffer());
+      const pdf = jpegToPdf(jpeg, c.width, c.height, A4_W_PT, A4_H_PT);
+      triggerDownload("string_art_card.pdf", pdf, "application/pdf");
+      cardMsgLine.textContent =
+        "A4 landscape, " + CARD_DPI + " dpi, " + Math.round(pdf.length / 1024) +
+        " kB. Print at 100% scale, not fit-to-page.";
+    } catch (err) {
+      cardMsgLine.textContent = "Could not build the PDF: " + err.message;
+    }
+    cardPdfBtn.textContent = was;
+    cardPdfBtn.disabled = false;
   });
 
   downloadSvgBtn.addEventListener("click", () => {

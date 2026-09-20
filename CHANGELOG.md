@@ -4,6 +4,40 @@ All notable changes to the ESP8266 String Art Indexer are recorded here.
 
 ---
 
+## [1.10.0] — 2026-09-20
+
+### Changed
+
+- **Servo angles are set by dragging, not by typing.** Rest and Feed are now
+  sliders, and the arm follows them live while you drag, so you set them by
+  watching where the tube actually goes. Letting go saves and parks the arm back
+  at rest. Requests are throttled to one per 120 ms — a range input fires on
+  every pixel and the ESP8266 does not need sixty a second to nudge a servo.
+
+  Added **Hold at rest**, **Hold at feed** and **Swing rest → feed → rest** so
+  the real motion can be watched at the configured slew speed, plus a readout of
+  where the arm is and how big the throw is.
+
+- **Wrap geometry is stored as real numbers**, not `0 = work it out`. The values
+  are filled in from the nail count at first boot, on Restore defaults, and
+  whenever the nail count changes — step counts are meaningless against a
+  different pitch. Each field shows what it works out to in nails, and flags
+  when it differs from the computed value.
+
+- **The sweep is now exactly twice the approach offset.** Rounding the two
+  independently left the loop off centre: at 360 nails it crossed the ring at
+  +0.53 and −0.44 of a pitch instead of mirroring. Now every nail count gives a
+  symmetric loop — 360 nails is +0.527 / −0.527.
+
+### Added
+
+- **Reset to the values for this nail count** button, for getting back to the
+  computed geometry after experimenting.
+
+- `servotest` action; `servoAngle`, `autoLead` and `autoSweep` in `/status`.
+
+---
+
 ## [1.9.1] — 2026-09-19
 
 ### Fixed

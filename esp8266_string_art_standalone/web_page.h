@@ -558,13 +558,14 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
         never moves while it is extended. That cannot hook a nail.
       </div>
       <div class="field">
-        <label>Approach offset <span class="val">steps, 0 = on the nail</span></label>
-        <input id="wrapSteps" type="number" min="0" max="200">
+        <label>Approach offset <span class="val" id="wrapStepsNails">&mdash;</span></label>
+        <input id="wrapSteps" type="number" min="1" max="200">
       </div>
       <div class="field">
-        <label>Sweep distance <span class="val">steps, 0 = one nail</span></label>
-        <input id="wrapSweep" type="number" min="0" max="400">
+        <label>Sweep distance <span class="val" id="wrapSweepNails">&mdash;</span></label>
+        <input id="wrapSweep" type="number" min="1" max="400">
       </div>
+      <button class="ghost" id="wrapRecalcBtn">Reset to the values for this nail count</button>
       <div class="field">
         <label>Wait after tube moves in <span class="val">ms</span></label>
         <input id="wrapHoldInMs" type="number" min="0" max="10000" step="50">
@@ -617,14 +618,27 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
 
     <details>
       <summary>Feeder servo (SG90) angles</summary>
+      <p class="idx-sub" style="text-align:left;margin-top:8px">
+        The arm follows these sliders as you drag them, so set them by watching
+        the tube rather than by guessing numbers. Rest is where it sits clear of
+        the nails; Feed is where the tube is out past the ring.
+      </p>
+
       <div class="field">
-        <label>Rest angle <span class="val">&deg;</span></label>
-        <input id="feederRestAngle" type="number" min="0" max="180">
+        <label>Rest angle <span class="val" id="restVal">&mdash;</span></label>
+        <input id="feederRestAngle" type="range" min="0" max="180" step="1">
       </div>
       <div class="field">
-        <label>Feed angle <span class="val">&deg;</span></label>
-        <input id="feederFeedAngle" type="number" min="0" max="180">
+        <label>Feed angle <span class="val" id="feedVal">&mdash;</span></label>
+        <input id="feederFeedAngle" type="range" min="0" max="180" step="1">
       </div>
+
+      <div class="btn-pair">
+        <button class="ghost" id="servoGoRest">Hold at rest</button>
+        <button class="ghost" id="servoGoFeed">Hold at feed</button>
+      </div>
+      <button class="ghost" id="servoSwing">Swing rest &rarr; feed &rarr; rest</button>
+      <div class="stat-line" id="servoLiveText">&mdash;</div>
     </details>
 
     <div class="msg" id="advMsg"></div>
@@ -1397,6 +1411,15 @@ window.NailCount = (function(){
   const wrapHoldSweepMs = document.getElementById("wrapHoldSweepMs");
   const servoSlewDeg = document.getElementById("servoSlewDeg");
   const servoSlewMs = document.getElementById("servoSlewMs");
+  const restVal = document.getElementById("restVal");
+  const feedVal = document.getElementById("feedVal");
+  const servoGoRest = document.getElementById("servoGoRest");
+  const servoGoFeed = document.getElementById("servoGoFeed");
+  const servoSwing = document.getElementById("servoSwing");
+  const servoLiveText = document.getElementById("servoLiveText");
+  const wrapStepsNails = document.getElementById("wrapStepsNails");
+  const wrapSweepNails = document.getElementById("wrapSweepNails");
+  const wrapRecalcBtn = document.getElementById("wrapRecalcBtn");
   const feederAutoFeed = document.getElementById("feederAutoFeed");
   const feederFeedBtn = document.getElementById("feederFeedBtn");
   const feederRestAngle = document.getElementById("feederRestAngle");
@@ -1484,6 +1507,13 @@ window.NailCount = (function(){
       if (document.activeElement !== wrapDirFlip) wrapDirFlip.checked = (j.wrapDir < 0);
       syncField(wrapSteps, j.wrapSteps);
       syncField(wrapSweep, j.wrapSweep);
+      const perN = (j.stepsPerRevX100 / 100) / j.numNails;
+      wrapStepsNails.textContent =
+        (+wrapSteps.value / perN).toFixed(2) + " nails" +
+        (+wrapSteps.value === j.autoLead ? "" : "  (auto " + j.autoLead + ")");
+      wrapSweepNails.textContent =
+        (+wrapSweep.value / perN).toFixed(2) + " nails" +
+        (+wrapSweep.value === j.autoSweep ? "" : "  (auto " + j.autoSweep + ")");
       syncField(wrapHoldInMs, j.wrapHoldInMs);
       syncField(wrapHoldSweepMs, j.wrapHoldSweepMs);
       syncField(servoSlewDeg, j.servoSlewDeg);
@@ -1516,6 +1546,10 @@ window.NailCount = (function(){
       if (document.activeElement !== feederAutoFeed) feederAutoFeed.checked = j.feederAutoFeed;
       syncField(feederRestAngle, j.feederRestAngle);
       syncField(feederFeedAngle, j.feederFeedAngle);
+      restVal.textContent = feederRestAngle.value + "\u00b0";
+      feedVal.textContent = feederFeedAngle.value + "\u00b0";
+      servoLiveText.textContent = "Arm is at " + j.servoAngle + "\u00b0. Throw is " +
+        Math.abs(feederFeedAngle.value - feederRestAngle.value) + "\u00b0.";
       syncField(feederPulseMs, j.feederPulseMs);
       syncField(feederSettleMs, j.feederSettleMs);
       syncField(feederRecoverMs, j.feederRecoverMs);
@@ -1665,6 +1699,52 @@ window.NailCount = (function(){
   // The direction toggle is a switch, not a text field, so it saves at once.
   idxReverseDir.addEventListener("change", saveAdvanced);
   idxAutoHome.addEventListener("change", saveAdvanced);
+
+  // ---- live servo angles -----------------------------------------------
+  // The arm follows the slider while you drag. Throttled, because a range
+  // input fires on every pixel and the ESP8266 does not need 60 requests a
+  // second to move a servo 2 degrees at a time.
+  let servoSendAt = 0, servoPending = null;
+  function previewAngle(a) {
+    servoPending = a;
+    const now = Date.now();
+    if (now - servoSendAt < 120) return;
+    servoSendAt = now;
+    const send = servoPending; servoPending = null;
+    fetch("/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "cmd=servotest&value=" + send,
+    }).catch(() => {});
+  }
+  feederRestAngle.addEventListener("input", () => {
+    restVal.textContent = feederRestAngle.value + "\u00b0";
+    previewAngle(feederRestAngle.value);
+  });
+  feederFeedAngle.addEventListener("input", () => {
+    feedVal.textContent = feederFeedAngle.value + "\u00b0";
+    previewAngle(feederFeedAngle.value);
+  });
+  // Dragging previews; letting go saves and parks the arm back at rest.
+  for (const el of [feederRestAngle, feederFeedAngle]) {
+    el.addEventListener("change", async () => {
+      await saveAdvanced();
+      previewAngle(feederRestAngle.value);
+    });
+  }
+  servoGoRest.addEventListener("click", () => previewAngle(feederRestAngle.value));
+  servoGoFeed.addEventListener("click", () => previewAngle(feederFeedAngle.value));
+  servoSwing.addEventListener("click", () => idxAct("feed"));
+
+  wrapRecalcBtn.addEventListener("click", async () => {
+    await fetch("/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "recalcWrap=1",
+    });
+    clearDirty();
+    refreshIndexer();
+  });
   wrapMode.addEventListener("change", saveAdvanced);
   wrapDirFlip.addEventListener("change", saveAdvanced);
   wrapTestBtn.addEventListener("click", () => idxAct("wraptest"));

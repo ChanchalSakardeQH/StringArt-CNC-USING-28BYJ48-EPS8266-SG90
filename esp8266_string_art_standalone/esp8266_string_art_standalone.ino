@@ -104,6 +104,9 @@ bool servoBusy();
 void servoGoTo(uint8_t a);
 void servoSnapTo(uint8_t a);
 void serviceServo();
+long autoLeadMag();
+long autoSweepMag();
+void applyAutoWrapGeometry();
 long wrapLeadMag();
 long wrapSweepMag();
 long wrapSignedLead();
@@ -361,8 +364,11 @@ uint16_t wrapTargetNail = 0;
 int8_t wrapApproachDir = 1;
 
 bool wrapMode = true;      // false = old behaviour, a simple pay-out pulse
-uint16_t wrapSteps = 0;    // where the servo crosses on approach; 0 = auto (half a pitch)
-uint16_t wrapSweep = 0;    // how far the disc travels during the sweep; 0 = auto (one pitch)
+// Real step counts, not "0 means work it out". They are filled in from the nail
+// count at first boot and whenever the nail count changes, so the UI always has
+// concrete numbers to show and to tune from.
+uint16_t wrapSteps = 0;    // how far past the nail the disc runs before the servo moves
+uint16_t wrapSweep = 0;    // how far the disc carries the thread while the tube is out
 int8_t wrapDir = 1;        // which side to approach from; flip if wraps shed
 
 // The two waits that give the thread time to seat. These are the ones that
@@ -515,11 +521,25 @@ void armFeedAfterMove(bool wantFeed) {
 // How far past the nail the disc runs before the servo moves, as a magnitude.
 // Half a pitch by default: the crossing then falls midway between two nails, so
 // the tube goes through a gap instead of into a nail.
-long wrapLeadMag() {
-  if (wrapSteps > 0) return (long)wrapSteps;
-  if (numNails == 0) return 0;
+long autoLeadMag() {
+  if (numNails == 0) return 1;
   long half = (stepsPerRevX100 / (long)numNails / 2 + 50L) / 100L;
   return half < 1 ? 1 : half;
+}
+
+// Twice the lead, deliberately, rather than the pitch rounded on its own.
+// Rounding the two independently leaves the loop sitting off centre -- at 360
+// nails it crossed at +0.53 and -0.44 of a pitch instead of mirroring.
+long autoSweepMag() { return autoLeadMag() * 2; }
+
+void applyAutoWrapGeometry() {
+  wrapSteps = (uint16_t)autoLeadMag();
+  wrapSweep = (uint16_t)autoSweepMag();
+}
+
+long wrapLeadMag() {
+  if (wrapSteps > 0) return (long)wrapSteps;
+  return autoLeadMag();
 }
 
 // How far the disc carries the thread round while the tube is out, as a
@@ -527,9 +547,7 @@ long wrapLeadMag() {
 // side of the target nail to the other.
 long wrapSweepMag() {
   if (wrapSweep > 0) return (long)wrapSweep;
-  if (numNails == 0) return 0;
-  long pitch = (stepsPerRevX100 / (long)numNails + 50L) / 100L;
-  return pitch < 1 ? 1 : pitch;
+  return autoSweepMag();
 }
 
 // The loop is handed off the direction of travel, with wrapDir as a global flip
@@ -890,6 +908,9 @@ void handleStatus() {
   json += "\"wrapSweep\":" + String(wrapSweep) + ",";
   json += "\"wrapAutoSweep\":" + String(wrapSweepMag()) + ",";
   json += "\"wrapApproachDir\":" + String((int)wrapApproachDir) + ",";
+  json += "\"autoLead\":" + String(autoLeadMag()) + ",";
+  json += "\"autoSweep\":" + String(autoSweepMag()) + ",";
+  json += "\"servoAngle\":" + String(servoCurrent) + ",";
   json += "\"wrapHoldInMs\":" + String(wrapHoldInMs) + ",";
   json += "\"wrapHoldSweepMs\":" + String(wrapHoldSweepMs) + ",";
   json += "\"servoSlewDeg\":" + String(servoSlewDeg) + ",";
@@ -923,8 +944,6 @@ void handleConfig() {
     feederSettleMs = DEF_FEEDER_SETTLE_MS;
     feederRecoverMs = DEF_FEEDER_RECOVER_MS;
     wrapMode = true;
-    wrapSteps = 0;
-    wrapSweep = 0;
     wrapDir = 1;
     wrapHoldInMs = 400;
     wrapHoldSweepMs = 400;
@@ -933,13 +952,21 @@ void handleConfig() {
     stepsPerRevX100 = STEPS_PER_REV_X100_DEF;
     nailOffsetSteps = 0;
     rehomeEvery = 0;
+    applyAutoWrapGeometry();
     saveConfig();
     if (!feederBusy() && !wrapBusy()) servoSnapTo(feederRestAngle);
     sendCorsHeaders();
     server.send(200, "text/plain", "ok");
     return;
   }
-  if (server.hasArg("numNails")) numNails = server.arg("numNails").toInt();
+  if (server.hasArg("numNails")) {
+    uint16_t was = numNails;
+    numNails = server.arg("numNails").toInt();
+    // Step counts are meaningless against a different nail pitch, so rebuild
+    // them. Changing the nail count invalidates the sequence anyway.
+    if (numNails != was) applyAutoWrapGeometry();
+  }
+  if (server.hasArg("recalcWrap")) applyAutoWrapGeometry();
   if (server.hasArg("stepDelay")) stepDelayMs = server.arg("stepDelay").toInt();
   if (server.hasArg("autoMs")) autoAdvanceMs = server.arg("autoMs").toInt();
   if (server.hasArg("dirSign")) dirSign = (server.arg("dirSign").toInt() < 0) ? -1 : 1;
@@ -1061,6 +1088,15 @@ void handleAction() {
     calRunning = false;
     calRevs = 0;
     saveConfig();
+  } else if (cmd == "servotest") {
+    // Drives the arm straight to an angle so it can be dialled in by eye.
+    // Refused while anything else is using the servo.
+    if (!wrapBusy() && !feederBusy() && !autoRunning) {
+      int a = server.arg("value").toInt();
+      if (a < 0) a = 0;
+      if (a > 180) a = 180;
+      servoGoTo((uint8_t)a);
+    }
   } else if (cmd == "wraptest") {
     // One wrap cycle on the nail currently at the feeder, for tuning the
     // overshoot and servo angles without committing to a run.
@@ -1120,6 +1156,7 @@ void setup() {
 
   LittleFS.begin();
   loadConfig();
+  if (wrapSteps == 0 || wrapSweep == 0) applyAutoWrapGeometry();
   loadSequenceFromFile();
   loadState();
   if (currentIndex >= (int)sequence.size()) currentIndex = 0;

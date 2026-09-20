@@ -215,6 +215,15 @@ crossings exactly midway between nails. **Test one wrap** in Advanced → Wrap
 cycle runs a single cycle so you can tune it without starting a run. If wraps
 shed, try *Approach from the other side* first — it reverses the handedness.
 
+### Setting the servo angles
+
+Advanced → Feeder servo (SG90) angles. Both are sliders and **the arm follows
+them as you drag**, so set them by watching the tube rather than guessing.
+Rest is where the arm sits clear of the nails; Feed is where the tube is out
+past the ring. **Swing rest → feed → rest** plays the real motion at the
+configured speed. Letting go of a slider saves it and parks the arm back at
+rest.
+
 Three things have to be true mechanically or no timing will save it:
 
 - The tube tip must end up **outside the nail ring** when the servo is out.
@@ -450,4 +459,4 @@ and watch it change.
 
 ## Credits
 
-Chanchal Sakarde. All Copy Rights Reserved. 
+Chanchal Sakarde. All Copy Rights Reserved.

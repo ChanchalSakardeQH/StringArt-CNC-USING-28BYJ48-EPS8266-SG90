@@ -586,7 +586,12 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
         <label class="switch"><input type="checkbox" id="wrapDirFlip"><span class="slider"></span></label>
       </div>
       <div class="sync-box" id="wrapBreakdown">&mdash;</div>
-      <button class="ghost" id="wrapTestBtn">Test one wrap</button>
+      <div class="btn-pair">
+        <button class="ghost" id="wrapTestCwBtn">Test wrap, coming from &minus;</button>
+        <button class="ghost" id="wrapTestCcwBtn">Test wrap, coming from +</button>
+      </div>
+      <button class="ghost" id="wrapTestBtn">Test one wrap, as the sequence would</button>
+      <div class="stat-line" id="wrapTestText">&nbsp;</div>
     </details>
 
     <details open>
@@ -1384,6 +1389,9 @@ window.NailCount = (function(){
   const wrapDirFlip = document.getElementById("wrapDirFlip");
   const wrapBreakdown = document.getElementById("wrapBreakdown");
   const wrapTestBtn = document.getElementById("wrapTestBtn");
+  const wrapTestCwBtn = document.getElementById("wrapTestCwBtn");
+  const wrapTestCcwBtn = document.getElementById("wrapTestCcwBtn");
+  const wrapTestText = document.getElementById("wrapTestText");
   const wrapSweep = document.getElementById("wrapSweep");
   const wrapHoldInMs = document.getElementById("wrapHoldInMs");
   const wrapHoldSweepMs = document.getElementById("wrapHoldSweepMs");
@@ -1661,6 +1669,25 @@ window.NailCount = (function(){
   wrapDirFlip.addEventListener("change", saveAdvanced);
   wrapTestBtn.addEventListener("click", () => idxAct("wraptest"));
 
+  // Approaching a nail from each side in turn. Both should now make the same
+  // little reversing move at the nail; before the fix one of them just carried
+  // straight on and dropped the thread.
+  async function testFrom(side) {
+    const st = await (await fetch("/status")).json();
+    if (!st.total) { wrapTestText.textContent = "Load a sequence first."; return; }
+    const nail = st.nextNail;
+    const n = st.numNails;
+    const away = ((nail - side * 6) % n + n) % n;   // park six nails to one side
+    wrapTestText.textContent = "Parking at nail " + away + "\u2026";
+    await idxAct("goto", away);
+    await new Promise(r => setTimeout(r, 1800));
+    wrapTestText.textContent = "Wrapping nail " + nail + ", approaching from " +
+      (side > 0 ? "+" : "\u2212") + ". Watch for the reversing move.";
+    await idxAct("wraptest");
+  }
+  wrapTestCwBtn.addEventListener("click", () => testFrom(-1));
+  wrapTestCcwBtn.addEventListener("click", () => testFrom(1));
+
   // Shows the loop the tube will actually trace, in steps and in nails, so an
   // overshoot that is too small to clear the neighbouring nails is obvious
   // before you run it rather than after a hundred dropped wraps.
@@ -1676,30 +1703,28 @@ window.NailCount = (function(){
     const perNail = (j.stepsPerRevX100 / 100) / j.numNails;
     const lead = j.wrapSteps > 0 ? j.wrapSteps : j.wrapAutoSteps;
     const sweep = j.wrapSweep > 0 ? j.wrapSweep : j.wrapAutoSweep;
-    const startF = lead / perNail;          // where the tube crosses going in
-    const endF = (lead - sweep) / perNail;  // and coming back out
     const travel = Math.abs(j.feederFeedAngle - j.feederRestAngle);
     const slewMs = Math.ceil(travel / Math.max(1, j.servoSlewDeg)) * j.servoSlewMs;
     const total = j.feederSettleMs + slewMs + j.wrapHoldInMs +
                   j.wrapHoldSweepMs + slewMs + j.feederRecoverMs;
-
-    // A crossing lands safely when it falls near the middle of a gap between
-    // nails; at a whole number of pitches it is going straight at a nail.
-    const nearNail = (f) => Math.abs(f - Math.round(f)) < 0.25;
-    const risky = nearNail(startF) || nearNail(endF);
+    const overshootF = lead / perNail;
+    const backF = (sweep - lead) / perNail;
+    const risky = Math.abs(overshootF - Math.round(overshootF)) < 0.25 ||
+                  Math.abs(backF - Math.round(backF)) < 0.25;
 
     wrapBreakdown.className = "sync-box " + (risky ? "approx" : "exact");
     wrapBreakdown.innerHTML =
-      "Tube crosses the ring at <b>" + startF.toFixed(2) + "</b> and <b>" +
-      endF.toFixed(2) + "</b> nails from the target<br>" +
-      "<span class=\"dim\">sweep " + sweep + " steps = " +
-      (sweep / perNail).toFixed(2) + " of a pitch &middot; servo " + travel +
-      "&deg; in " + (slewMs / 1000).toFixed(2) + " s each way</span><br>" +
-      "<span class=\"dim\">cycle " + (total / 1000).toFixed(2) +
-      " s per nail, plus disc travel and dwell.</span>" +
+      "Overshoots <b>" + overshootF.toFixed(2) + "</b> nails past the target, " +
+      "sweeps back <b>" + (sweep / perNail).toFixed(2) + "</b>, lands on it<br>" +
+      "<span class=\"dim\">handed off the direction of travel (" +
+      (j.wrapApproachDir > 0 ? "+" : "\u2212") + " last time)" +
+      (j.wrapDir < 0 ? ", globally flipped" : "") + "</span><br>" +
+      "<span class=\"dim\">servo " + travel + "&deg; in " +
+      (slewMs / 1000).toFixed(2) + " s each way &middot; cycle " +
+      (total / 1000).toFixed(2) + " s plus disc travel and dwell.</span>" +
       (risky
-        ? "<br><b>A crossing lands on a nail.</b> Offset or sweep needs " +
-          "adjusting so both land near .5 of a pitch."
+        ? "<br><b>A crossing lands on a nail.</b> Adjust the offset or sweep so " +
+          "both fall near .5 of a pitch."
         : "");
   }
 

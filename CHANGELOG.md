@@ -4,6 +4,46 @@ All notable changes to the ESP8266 String Art Indexer are recorded here.
 
 ---
 
+## [1.9.1] — 2026-09-19
+
+### Fixed
+
+- **Half the chords never hooked the thread.** The wrap loop was signed by the
+  fixed `wrapDir` constant, but the direction the disc travels to reach a nail
+  changes from chord to chord. So on chords running one way the sweep reversed
+  the approach — the little hooking move, which caught — and on chords running
+  the other way the sweep simply continued the approach, the disc carried
+  straight on through the nail, and the thread was dropped.
+
+  The two cases produce mirror-image loops. Only one of them puts the tube on
+  the far side of the nail from the thread trailing behind it, so only one
+  wraps. This is why it worked clockwise and did nothing anticlockwise.
+
+  The loop is now handed off the measured direction of travel: overshoot past
+  the nail in the direction the disc is already going, sweep back across it,
+  land on it. Both chord directions now make the same reversing move.
+
+### Changed
+
+- `wrapLeadSteps()` / `wrapSweepSteps()` split into magnitudes
+  (`wrapLeadMag()`, `wrapSweepMag()`) and signed accessors, with the sign from
+  `wrapApproachDir * wrapDir`. `startWrap()` measures the approach direction
+  from the shortest-path delta before it starts moving.
+
+- *Approach from the other side* still works, flipping both directions together
+  rather than pinning them to one.
+
+### Added
+
+- **Test wrap from − / from +** buttons, which park the disc six nails to one
+  side and then wrap, so each approach direction can be checked on its own.
+  Both should now produce the same reversing move at the nail.
+
+- The wrap breakdown reports the overshoot and sweep in nail pitches and which
+  direction the last wrap was handed. `wrapApproachDir` added to `/status`.
+
+---
+
 ## [1.9.0] — 2026-09-17
 
 ### Added

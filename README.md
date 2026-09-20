@@ -203,6 +203,13 @@ The servo is walked to its target a couple of degrees at a time rather than
 commanded straight there — `Servo.write()` has no speed parameter, so an SG90
 slams to position otherwise. Servo speed and both waits are adjustable.
 
+The loop is handed off the direction the disc travels to reach each nail: it
+overshoots past the nail the way it is already going, sweeps back across it,
+then lands on it. That matters because the thread trails behind the direction of
+travel, and the tube has to pass on the far side from it. Signing the loop with
+a fixed constant instead wraps correctly one way round the disc and drops the
+thread the other way.
+
 The overshoot defaults to half a nail pitch each way, which puts both ring
 crossings exactly midway between nails. **Test one wrap** in Advanced → Wrap
 cycle runs a single cycle so you can tune it without starting a run. If wraps
@@ -443,4 +450,4 @@ and watch it change.
 
 ## Credits
 
-Chanchal Sakarde. All Copyrights reserved.
+Chanchal Sakarde. All Copy Rights Reserved. 

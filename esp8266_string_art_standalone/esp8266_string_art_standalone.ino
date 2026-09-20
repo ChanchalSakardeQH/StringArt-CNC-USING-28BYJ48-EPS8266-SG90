@@ -104,6 +104,10 @@ bool servoBusy();
 void servoGoTo(uint8_t a);
 void servoSnapTo(uint8_t a);
 void serviceServo();
+long wrapLeadMag();
+long wrapSweepMag();
+long wrapSignedLead();
+long wrapSignedSweep();
 long wrapSweepSteps();
 void saveState();
 void noteNailDone();
@@ -348,6 +352,13 @@ enum WrapPhase { WRAP_IDLE, WRAP_APPROACH, WRAP_SETTLE, WRAP_SERVO_IN,
 WrapPhase wrapPhase = WRAP_IDLE;
 unsigned long wrapNextAt = 0;
 uint16_t wrapTargetNail = 0;
+// Which way the disc travelled to reach this nail. The wrap loop is handed off
+// this, not off a fixed constant: the tube has to end up on the far side of the
+// nail from the incoming thread, and which side that is flips with the
+// direction of travel. Signing the loop with a constant makes half the chords
+// wrap the wrong way round -- they look like the disc simply carrying on
+// through the nail, with no hooking move at all.
+int8_t wrapApproachDir = 1;
 
 bool wrapMode = true;      // false = old behaviour, a simple pay-out pulse
 uint16_t wrapSteps = 0;    // where the servo crosses on approach; 0 = auto (half a pitch)
@@ -501,30 +512,47 @@ void armFeedAfterMove(bool wantFeed) {
 // Half a nail pitch by default: that puts the ring crossing exactly midway
 // between two nails, so the tube passes through a gap rather than into a nail,
 // and the swept loop encloses the target nail and nothing else.
-// Where the tube crosses the ring on the way in, as an offset from the target
-// nail. Half a pitch by default: the crossing then falls midway between two
-// nails, so the tube goes through a gap instead of into a nail.
-// Set it to 0 to stop on the nail itself before the servo moves.
-long wrapLeadSteps() {
-  if (wrapSteps > 0) return (long)wrapSteps * wrapDir;
+// How far past the nail the disc runs before the servo moves, as a magnitude.
+// Half a pitch by default: the crossing then falls midway between two nails, so
+// the tube goes through a gap instead of into a nail.
+long wrapLeadMag() {
+  if (wrapSteps > 0) return (long)wrapSteps;
   if (numNails == 0) return 0;
   long half = (stepsPerRevX100 / (long)numNails / 2 + 50L) / 100L;
-  if (half < 1) half = 1;
-  return half * wrapDir;
+  return half < 1 ? 1 : half;
 }
 
-// How far the disc carries the thread round while the tube is out. One whole
-// nail pitch by default, which is what takes the thread past the target nail.
-long wrapSweepSteps() {
-  if (wrapSweep > 0) return (long)wrapSweep * wrapDir;
+// How far the disc carries the thread round while the tube is out, as a
+// magnitude. One whole nail pitch by default, which takes the thread from one
+// side of the target nail to the other.
+long wrapSweepMag() {
+  if (wrapSweep > 0) return (long)wrapSweep;
   if (numNails == 0) return 0;
   long pitch = (stepsPerRevX100 / (long)numNails + 50L) / 100L;
-  if (pitch < 1) pitch = 1;
-  return pitch * wrapDir;
+  return pitch < 1 ? 1 : pitch;
 }
+
+// The loop is handed off the direction of travel, with wrapDir as a global flip
+// if the thread runs the other way round your tube.
+long wrapSignedLead()  { return wrapLeadMag()  * wrapApproachDir * wrapDir; }
+long wrapSignedSweep() { return wrapSweepMag() * wrapApproachDir * wrapDir; }
+
+// Backwards-compatible name, used by the status JSON.
+long wrapLeadSteps() { return wrapSignedLead(); }
+long wrapSweepSteps() { return wrapSignedSweep(); }
 
 void startWrap(uint16_t nail) {
   wrapTargetNail = nail;
+
+  // Work out which way the disc is about to travel, before moving, and hand the
+  // loop that way. Overshoot past the nail in the direction of travel, sweep
+  // back across it, land on it -- so the tube always passes on the far side
+  // from the thread trailing behind, whichever way the chord runs.
+  long delta = nailToStep(nail) - currentStep;
+  while (delta >  stepsPerRev() / 2) delta -= stepsPerRev();
+  while (delta < -stepsPerRev() / 2) delta += stepsPerRev();
+  if (delta != 0) wrapApproachDir = (delta > 0) ? 1 : -1;
+
   wrapPhase = WRAP_APPROACH;
   wrapNextAt = millis();
   // Straight to the approach position from wherever the disc is -- no need to
@@ -568,7 +596,7 @@ void serviceWrap() {
     case WRAP_HOLD_IN:
       // The wrap itself: the disc carries the thread past the nail while the
       // tube stays put.
-      beginMoveToStep(normalizeStep(nailStep + wrapLeadSteps() - wrapSweepSteps()));
+      beginMoveToStep(normalizeStep(nailStep + wrapSignedLead() - wrapSignedSweep()));
       wrapPhase = WRAP_SWEEP;
       break;
 
@@ -857,10 +885,11 @@ void handleStatus() {
   json += "\"homing\":" + String(homing ? "true" : "false") + ",";
   json += "\"wrapMode\":" + String(wrapMode ? "true" : "false") + ",";
   json += "\"wrapSteps\":" + String(wrapSteps) + ",";
-  json += "\"wrapAutoSteps\":" + String(labs(wrapLeadSteps())) + ",";
+  json += "\"wrapAutoSteps\":" + String(wrapLeadMag()) + ",";
   json += "\"wrapDir\":" + String((int)wrapDir) + ",";
   json += "\"wrapSweep\":" + String(wrapSweep) + ",";
-  json += "\"wrapAutoSweep\":" + String(labs(wrapSweepSteps())) + ",";
+  json += "\"wrapAutoSweep\":" + String(wrapSweepMag()) + ",";
+  json += "\"wrapApproachDir\":" + String((int)wrapApproachDir) + ",";
   json += "\"wrapHoldInMs\":" + String(wrapHoldInMs) + ",";
   json += "\"wrapHoldSweepMs\":" + String(wrapHoldSweepMs) + ",";
   json += "\"servoSlewDeg\":" + String(servoSlewDeg) + ",";

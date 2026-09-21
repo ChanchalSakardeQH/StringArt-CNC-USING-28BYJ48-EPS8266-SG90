@@ -211,6 +211,9 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   .eta-k{ font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--text-dim); }
   .eta-v{ font-size:.94rem; color:var(--text); }
   .jog-row{ display:flex; gap:5px; }
+  .walk-row{ display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:8px; }
+  .walk-row button{ margin:0; padding:9px 4px; font-size:.8rem; }
+  .walk-row button:last-child{ grid-column:1 / -1; }
   .jog-row button{ flex:1; width:auto; padding:9px 0; margin:0; font-size:.82rem; }
   .resume-banner{
     font-size:.78rem; line-height:1.5; border-radius:8px; padding:9px 11px;
@@ -557,14 +560,41 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
         Off = the old behaviour: the servo just pays thread out and the disc
         never moves while it is extended. That cannot hook a nail.
       </div>
+      <p class="idx-sub" style="text-align:left;margin-top:8px">
+        The disc follows these sliders as you drag, around the nail at the
+        feeder. <b>Ahead</b> is where the tube swings out, past the nail in the
+        direction of travel. <b>Behind</b> is where it swings back in, on the
+        other side. The nail sits between them.
+      </p>
+
+      <div class="switch-row">
+        <span>Preview as if the disc arrived travelling &minus;</span>
+        <label class="switch"><input type="checkbox" id="wrapPrevNeg"><span class="slider"></span></label>
+      </div>
+
       <div class="field">
-        <label>Approach offset <span class="val" id="wrapStepsNails">&mdash;</span></label>
-        <input id="wrapSteps" type="number" min="1" max="200">
+        <label>Ahead of the nail <span class="val" id="wrapAheadVal">&mdash;</span></label>
+        <input id="wrapAhead" type="range" min="1" max="24" step="1">
       </div>
       <div class="field">
-        <label>Sweep distance <span class="val" id="wrapSweepNails">&mdash;</span></label>
-        <input id="wrapSweep" type="number" min="1" max="400">
+        <label>Behind the nail <span class="val" id="wrapBehindVal">&mdash;</span></label>
+        <input id="wrapBehind" type="range" min="0" max="24" step="1">
       </div>
+      <input id="wrapSteps" type="hidden">
+      <input id="wrapSweep" type="hidden">
+      <div class="stat-line" id="wrapPosText">&mdash;</div>
+
+      <label style="font-size:.78rem;color:var(--text-dim);font-weight:600;margin:10px 0 5px;display:block">
+        Walk through one wrap by hand
+      </label>
+      <div class="walk-row">
+        <button class="ghost" data-walk="ahead">1 &middot; Disc ahead</button>
+        <button class="ghost" data-walk="out">2 &middot; Tube out</button>
+        <button class="ghost" data-walk="behind">3 &middot; Disc behind</button>
+        <button class="ghost" data-walk="in">4 &middot; Tube in</button>
+        <button class="ghost" data-walk="land">5 &middot; On the nail</button>
+      </div>
+
       <button class="ghost" id="wrapRecalcBtn">Reset to the values for this nail count</button>
       <div class="field">
         <label>Wait after tube moves in <span class="val">ms</span></label>
@@ -1417,8 +1447,13 @@ window.NailCount = (function(){
   const servoGoFeed = document.getElementById("servoGoFeed");
   const servoSwing = document.getElementById("servoSwing");
   const servoLiveText = document.getElementById("servoLiveText");
-  const wrapStepsNails = document.getElementById("wrapStepsNails");
-  const wrapSweepNails = document.getElementById("wrapSweepNails");
+  const wrapAhead = document.getElementById("wrapAhead");
+  const wrapBehind = document.getElementById("wrapBehind");
+  const wrapAheadVal = document.getElementById("wrapAheadVal");
+  const wrapBehindVal = document.getElementById("wrapBehindVal");
+  const wrapPrevNeg = document.getElementById("wrapPrevNeg");
+  const wrapPosText = document.getElementById("wrapPosText");
+  let lastStatus = null;
   const wrapRecalcBtn = document.getElementById("wrapRecalcBtn");
   const feederAutoFeed = document.getElementById("feederAutoFeed");
   const feederFeedBtn = document.getElementById("feederFeedBtn");
@@ -1505,15 +1540,23 @@ window.NailCount = (function(){
       if (document.activeElement !== idxAutoHome) idxAutoHome.checked = j.autoHomeOnBoot;
       if (document.activeElement !== wrapMode) wrapMode.checked = j.wrapMode;
       if (document.activeElement !== wrapDirFlip) wrapDirFlip.checked = (j.wrapDir < 0);
+      lastStatus = j;
       syncField(wrapSteps, j.wrapSteps);
       syncField(wrapSweep, j.wrapSweep);
+      // Slider range scales with the nail pitch: up to two nails either side.
       const perN = (j.stepsPerRevX100 / 100) / j.numNails;
-      wrapStepsNails.textContent =
-        (+wrapSteps.value / perN).toFixed(2) + " nails" +
-        (+wrapSteps.value === j.autoLead ? "" : "  (auto " + j.autoLead + ")");
-      wrapSweepNails.textContent =
-        (+wrapSweep.value / perN).toFixed(2) + " nails" +
-        (+wrapSweep.value === j.autoSweep ? "" : "  (auto " + j.autoSweep + ")");
+      const maxS = Math.max(4, Math.round(perN * 2));
+      wrapAhead.max = maxS; wrapBehind.max = maxS;
+      if (!dirty.has("wrapAhead") && document.activeElement !== wrapAhead)
+        wrapAhead.value = j.wrapSteps;
+      if (!dirty.has("wrapBehind") && document.activeElement !== wrapBehind)
+        wrapBehind.value = Math.max(0, j.wrapSweep - j.wrapSteps);
+      labelWrap(j);
+      const off = j.discOffset;
+      wrapPosText.textContent = "Disc is " +
+        (off === 0 ? "on nail " + j.previewNail
+                   : Math.abs(off) + " steps (" + (Math.abs(off) / perN).toFixed(2) +
+                     " nails) " + (off > 0 ? "+" : "\u2212") + " of nail " + j.previewNail) + ".";
       syncField(wrapHoldInMs, j.wrapHoldInMs);
       syncField(wrapHoldSweepMs, j.wrapHoldSweepMs);
       syncField(servoSlewDeg, j.servoSlewDeg);
@@ -1656,9 +1699,9 @@ window.NailCount = (function(){
       "&feederAutoFeed=" + (feederAutoFeed.checked ? 1 : 0) +
       "&autoHomeOnBoot=" + (idxAutoHome.checked ? 1 : 0) +
       "&wrapMode=" + (wrapMode.checked ? 1 : 0) +
-      "&wrapSteps=" + wrapSteps.value +
+      "&wrapSteps=" + wrapAhead.value +
       "&wrapDir=" + (wrapDirFlip.checked ? -1 : 1) +
-      "&wrapSweep=" + wrapSweep.value +
+      "&wrapSweep=" + (+wrapAhead.value + +wrapBehind.value) +
       "&wrapHoldInMs=" + wrapHoldInMs.value +
       "&wrapHoldSweepMs=" + wrapHoldSweepMs.value +
       "&servoSlewDeg=" + servoSlewDeg.value +
@@ -1736,6 +1779,75 @@ window.NailCount = (function(){
   servoGoFeed.addEventListener("click", () => previewAngle(feederFeedAngle.value));
   servoSwing.addEventListener("click", () => idxAct("feed"));
 
+  // ---- live disc sweep --------------------------------------------------
+  // Same idea as the servo sliders: the disc moves as you drag, parked
+  // relative to the nail at the feeder, so ahead and behind are set by
+  // watching where the tube crosses rather than by guessing step counts.
+
+  // Which way "ahead" points. Real wraps hand themselves off the direction of
+  // travel; the preview lets you check either, with the global flip applied.
+  function aheadSign() {
+    const travel = wrapPrevNeg.checked ? -1 : 1;
+    const flip = lastStatus && lastStatus.wrapDir < 0 ? -1 : 1;
+    return travel * flip;
+  }
+
+  function labelWrap(j) {
+    const perN = (j.stepsPerRevX100 / 100) / j.numNails;
+    const a = +wrapAhead.value, b = +wrapBehind.value;
+    wrapAheadVal.textContent = a + " steps \u00b7 " + (a / perN).toFixed(2) + " nails" +
+      (a === j.autoLead ? "" : "  (auto " + j.autoLead + ")");
+    wrapBehindVal.textContent = b + " steps \u00b7 " + (b / perN).toFixed(2) + " nails" +
+      (b === j.autoSweep - j.autoLead ? "" : "  (auto " + (j.autoSweep - j.autoLead) + ")");
+  }
+
+  let discSendAt = 0, discTimer = null;
+  function previewDisc(offset) {
+    const go = () => {
+      discSendAt = Date.now();
+      fetch("/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "cmd=wrappreview&value=" + offset,
+      }).catch(() => {});
+    };
+    // Throttled like the servo, and always delivers the last position so the
+    // disc ends where the slider was actually let go.
+    clearTimeout(discTimer);
+    if (Date.now() - discSendAt > 150) go();
+    else discTimer = setTimeout(go, 150);
+  }
+
+  wrapAhead.addEventListener("input", () => {
+    dirty.add("wrapAhead");
+    if (lastStatus) labelWrap(lastStatus);
+    previewDisc(aheadSign() * +wrapAhead.value);
+  });
+  wrapBehind.addEventListener("input", () => {
+    dirty.add("wrapBehind");
+    if (lastStatus) labelWrap(lastStatus);
+    previewDisc(-aheadSign() * +wrapBehind.value);
+  });
+  // Letting go saves, and leaves the disc where it is so you can still see it.
+  for (const el of [wrapAhead, wrapBehind]) {
+    el.addEventListener("change", async () => {
+      await saveAdvanced();
+      dirty.delete("wrapAhead"); dirty.delete("wrapBehind");
+    });
+  }
+
+  // Walk one wrap through by hand, the same five moves the sequencer makes.
+  document.querySelectorAll("[data-walk]").forEach(b => {
+    b.addEventListener("click", () => {
+      const w = b.dataset.walk;
+      if (w === "ahead")  previewDisc(aheadSign() * +wrapAhead.value);
+      if (w === "behind") previewDisc(-aheadSign() * +wrapBehind.value);
+      if (w === "land")   previewDisc(0);
+      if (w === "out")    previewAngle(feederFeedAngle.value);
+      if (w === "in")     previewAngle(feederRestAngle.value);
+    });
+  });
+
   wrapRecalcBtn.addEventListener("click", async () => {
     await fetch("/config", {
       method: "POST",
@@ -1743,6 +1855,7 @@ window.NailCount = (function(){
       body: "recalcWrap=1",
     });
     clearDirty();
+    dirty.delete("wrapAhead"); dirty.delete("wrapBehind");
     refreshIndexer();
   });
   wrapMode.addEventListener("change", saveAdvanced);

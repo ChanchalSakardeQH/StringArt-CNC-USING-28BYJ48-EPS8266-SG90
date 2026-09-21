@@ -215,6 +215,20 @@ crossings exactly midway between nails. **Test one wrap** in Advanced → Wrap
 cycle runs a single cycle so you can tune it without starting a run. If wraps
 shed, try *Approach from the other side* first — it reverses the handedness.
 
+### Setting the disc sweep
+
+Advanced → Wrap cycle. **Ahead** is where the tube swings out, past the nail in
+the direction of travel; **Behind** is where it swings back in on the other side.
+Both are sliders and **the disc follows them as you drag**, parked around the
+nail at the feeder. Defaults are half a nail each way.
+
+Then use **Walk through one wrap by hand** — five buttons making the same moves
+the machine will: disc ahead, tube out, disc behind, tube in, back on the nail.
+Do it with thread on. If it hooks by hand, it will hook on the run.
+
+Wraps hand themselves off the direction the disc travels, so check both: flip
+*Preview as if travelling −* and walk it through again.
+
 ### Setting the servo angles
 
 Advanced → Feeder servo (SG90) angles. Both are sliders and **the arm follows

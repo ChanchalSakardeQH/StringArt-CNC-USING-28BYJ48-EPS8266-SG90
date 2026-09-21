@@ -119,6 +119,8 @@ void startWrap(uint16_t nail);
 void serviceWrap();
 void abortWrap();
 void presentNail(uint16_t nail, bool doFeed);
+uint16_t previewNail();
+long discOffsetFromNail();
 void writeCoils(uint8_t idx);
 void coilsOff();
 long normalizeStep(long s);
@@ -682,6 +684,22 @@ void presentNail(uint16_t nail, bool doFeed) {
   }
 }
 
+// The nail the wrap preview works around: the one the sequence is on, or nail
+// 0 if nothing is loaded yet.
+uint16_t previewNail() {
+  if (!sequence.empty() && currentIndex >= 0 && currentIndex < (int)sequence.size())
+    return sequence[currentIndex];
+  return 0;
+}
+
+// Where the disc sits relative to the preview nail, in steps, shortest way.
+long discOffsetFromNail() {
+  long d = currentStep - nailToStep(previewNail());
+  while (d >  stepsPerRev() / 2) d -= stepsPerRev();
+  while (d < -stepsPerRev() / 2) d += stepsPerRev();
+  return d;
+}
+
 void startHoming(int8_t dir) {
   homing = true;
   homeError = false;
@@ -911,6 +929,8 @@ void handleStatus() {
   json += "\"autoLead\":" + String(autoLeadMag()) + ",";
   json += "\"autoSweep\":" + String(autoSweepMag()) + ",";
   json += "\"servoAngle\":" + String(servoCurrent) + ",";
+  json += "\"previewNail\":" + String(previewNail()) + ",";
+  json += "\"discOffset\":" + String(discOffsetFromNail()) + ",";
   json += "\"wrapHoldInMs\":" + String(wrapHoldInMs) + ",";
   json += "\"wrapHoldSweepMs\":" + String(wrapHoldSweepMs) + ",";
   json += "\"servoSlewDeg\":" + String(servoSlewDeg) + ",";
@@ -1088,6 +1108,17 @@ void handleAction() {
     calRunning = false;
     calRevs = 0;
     saveConfig();
+  } else if (cmd == "wrappreview") {
+    // Park the disc a signed number of steps from the nail at the feeder, so
+    // the ahead and behind positions of the wrap can be set by eye. Paired with
+    // "servotest" this walks through a wrap by hand, one move at a time.
+    if (!wrapBusy() && !feederBusy() && !autoRunning && !calRunning) {
+      long off = server.arg("value").toInt();
+      long cap = stepsPerRev() / 4;
+      if (off > cap) off = cap;
+      if (off < -cap) off = -cap;
+      beginMoveToStep(normalizeStep(nailToStep(previewNail()) + off));
+    }
   } else if (cmd == "servotest") {
     // Drives the arm straight to an angle so it can be dialled in by eye.
     // Refused while anything else is using the servo.

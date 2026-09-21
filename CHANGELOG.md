@@ -4,6 +4,42 @@ All notable changes to the ESP8266 String Art Indexer are recorded here.
 
 ---
 
+## [1.11.0] — 2026-09-21
+
+### Changed
+
+- **The disc sweep is set by dragging, like the servo angles.** The two wrap
+  numbers are now presented as **Ahead** — where the tube swings out, past the
+  nail in the direction of travel — and **Behind** — where it swings back in on
+  the other side. Both are sliders, and the disc moves to follow them as you
+  drag, parked relative to the nail at the feeder, so you set them by watching
+  where the tube crosses rather than by guessing step counts.
+
+  Letting go saves. The disc stays where you left it so you can still see the
+  position. Each slider shows its value in steps and in nails, and flags when it
+  differs from the computed default. The range scales with the nail pitch, up to
+  two nails either side.
+
+  Ahead and Behind can now differ — the old offset/sweep pair could express this
+  but made it hard to reason about. Storage is unchanged (`wrapSteps` = ahead,
+  `wrapSweep` = ahead + behind), so existing settings carry over.
+
+- A **Preview as if travelling −** toggle, because real wraps hand themselves
+  off the direction of travel. The preview reproduces the real stop positions
+  exactly in all four combinations of travel direction and the global flip.
+
+### Added
+
+- **Walk through one wrap by hand**: five buttons making the same five moves the
+  sequencer makes — disc ahead, tube out, disc behind, tube in, back on the
+  nail. The way to check the thread actually hooks with your settings before
+  committing to a run.
+
+- `wrappreview` action; `previewNail` and `discOffset` in `/status`, with a
+  readout of where the disc sits relative to the nail.
+
+---
+
 ## [1.10.0] — 2026-09-20
 
 ### Changed

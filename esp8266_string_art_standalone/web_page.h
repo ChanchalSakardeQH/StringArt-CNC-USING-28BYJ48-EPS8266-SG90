@@ -1,3 +1,26 @@
+// SPDX-License-Identifier: GPL-3.0-or-later AND MIT
+// Copyright (C) 2026 YOUR NAME
+//
+// This file is part of ESP8266 String Art CNC.
+//
+// ESP8266 String Art CNC is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option) any
+// later version.
+//
+// ESP8266 String Art CNC is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+// details.
+//
+// You should have received a copy of the GNU General Public License along with
+// ESP8266 String Art CNC. If not, see <https://www.gnu.org/licenses/>.
+//
+// This file bundles Cropper.js 1.6.1, Copyright 2015-present Chen Fengyuan,
+// under the MIT licence; its original banner is kept below. The base
+// template designer is adapted from StringArt-CircleBase-Design by Chanchal
+// Sakarde. See THIRD_PARTY_NOTICES.md.
+
 // =============================================================================
 //  web_page.h -- the machine's web UI, as one PROGMEM string
 // =============================================================================
@@ -28,6 +51,13 @@
 
 const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
 <!DOCTYPE html>
+<!--
+  ESP8266 String Art CNC. Copyright (C) 2026 YOUR NAME.
+  SPDX-License-Identifier: GPL-3.0-or-later AND MIT
+  Free software under the GNU GPL v3 or later; ABSOLUTELY NO WARRANTY.
+  Source: https://github.com/OWNER/REPO
+  Bundles Cropper.js 1.6.1 (MIT, Chen Fengyuan) -- banner kept below.
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -210,6 +240,13 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   .eta-grid > div{ display:flex; flex-direction:column; }
   .eta-k{ font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--text-dim); }
   .eta-v{ font-size:.94rem; color:var(--text); }
+  .legal{
+    margin-top:22px; padding-top:12px; border-top:1px solid var(--border);
+    font-size:.72rem; line-height:1.55; color:var(--text-dim);
+  }
+  .legal b{ color:var(--text); }
+  .legal a{ color:inherit; text-decoration:underline; }
+  .legal-dim{ display:block; margin-top:6px; opacity:.85; }
   .jog-row{ display:flex; gap:5px; }
   .walk-row{ display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:8px; }
   .walk-row button{ margin:0; padding:9px 4px; font-size:.8rem; }
@@ -540,6 +577,11 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       <button class="ghost" id="idxDirTestBtn">Run direction test</button>
       <div class="idx-sub" id="idxDirTestText" style="text-align:left">&nbsp;</div>
       <div class="switch-row">
+        <span>OLED display upside down</span>
+        <label class="switch"><input type="checkbox" id="oledFlip"><span class="slider"></span></label>
+      </div>
+      <div class="idx-sub" style="margin-top:0;text-align:left" id="oledText">&mdash;</div>
+      <div class="switch-row">
         <span>Find home on power-up</span>
         <label class="switch"><input type="checkbox" id="idxAutoHome"><span class="slider"></span></label>
       </div>
@@ -674,6 +716,23 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     <div class="msg" id="advMsg"></div>
     <button class="primary" id="advSaveBtn">Save advanced settings</button>
     <button class="ghost" id="advResetBtn">Restore defaults</button>
+
+    <!-- GPLv3 section 5(d): an interactive interface must show the legal notices. -->
+    <footer class="legal">
+      <b>ESP8266 String Art CNC</b><br>
+      Copyright &copy; 2026 YOUR NAME.<br>
+      Free software under the
+      <a href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener">GNU GPL v3 or later</a>.
+      It comes with <b>absolutely no warranty</b>. You may share and change it
+      under those terms.<br>
+      Source code:
+      <a href="https://github.com/OWNER/REPO" target="_blank" rel="noopener">github.com/OWNER/REPO</a><br>
+      <span class="legal-dim">
+        Includes Cropper.js by Chen Fengyuan (MIT), the 5&times;7 font from
+        Adafruit-GFX by Adafruit Industries (BSD), and a base template designer
+        adapted from StringArt-CircleBase-Design by Chanchal Sakarde.
+      </span>
+    </footer>
   </div>
 </div>
 
@@ -1417,6 +1476,8 @@ window.NailCount = (function(){
   const idxGotoStepHint = document.getElementById("idxGotoStepHint");
   const idxResumeBanner = document.getElementById("idxResumeBanner");
   const idxAutoHome = document.getElementById("idxAutoHome");
+  const oledFlip = document.getElementById("oledFlip");
+  const oledText = document.getElementById("oledText");
   const calJogUnit = document.getElementById("calJogUnit");
   const calNailVal = document.getElementById("calNailVal");
   const calSetBtn = document.getElementById("calSetBtn");
@@ -1538,6 +1599,11 @@ window.NailCount = (function(){
         ? "0 to " + (j.total - 1) + ", currently on " + j.currentIndex + "."
         : "No sequence loaded yet.";
       if (document.activeElement !== idxAutoHome) idxAutoHome.checked = j.autoHomeOnBoot;
+      if (document.activeElement !== oledFlip) oledFlip.checked = j.oledFlip;
+      oledText.textContent = j.oledAddr
+        ? "Display found at 0x" + j.oledAddr.toString(16).toUpperCase() +
+          ". Flip it if the text is upside down."
+        : "No display detected on D7 (SDA) / D4 (SCL). Everything else works without one.";
       if (document.activeElement !== wrapMode) wrapMode.checked = j.wrapMode;
       if (document.activeElement !== wrapDirFlip) wrapDirFlip.checked = (j.wrapDir < 0);
       lastStatus = j;
@@ -1742,6 +1808,14 @@ window.NailCount = (function(){
   // The direction toggle is a switch, not a text field, so it saves at once.
   idxReverseDir.addEventListener("change", saveAdvanced);
   idxAutoHome.addEventListener("change", saveAdvanced);
+  oledFlip.addEventListener("change", async () => {
+    await fetch("/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "oledFlip=" + (oledFlip.checked ? 1 : 0),
+    });
+    refreshIndexer();
+  });
 
   // ---- live servo angles -----------------------------------------------
   // The arm follows the slider while you drag. Throttled, because a range

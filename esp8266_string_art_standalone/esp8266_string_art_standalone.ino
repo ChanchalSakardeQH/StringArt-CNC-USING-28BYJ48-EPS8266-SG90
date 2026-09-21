@@ -1,6 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 YOUR NAME
+//
+// This file is part of ESP8266 String Art CNC.
+//
+// ESP8266 String Art CNC is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option) any
+// later version.
+//
+// ESP8266 String Art CNC is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+// details.
+//
+// You should have received a copy of the GNU General Public License along with
+// ESP8266 String Art CNC. If not, see <https://www.gnu.org/licenses/>.
+
 /*
-  ESP8266 String Art Indexer
-  ==========================
+  ESP8266 String Art CNC
+  ======================
   Drives a 28BYJ-48 stepper (via a ULN2003 driver board) that rotates a
   disc of nails. The motor's job is purely to index: bring the next nail
   in the sequence to a fixed pointer on the frame so you can wrap the
@@ -59,17 +77,31 @@
                    ULN2003, not the ESP8266's own 5V/3V3 pins)
     SG90 GND    -> common ground (same net as everything else above)
 
-    LIMIT_SWITCH -> one leg to ESP8266 D7 (GPIO13), the other leg to GND
-                    (the internal pull-up is enabled in firmware, so the
-                    switch just needs to short the pin to GND when
-                    triggered -- no external resistor needed)
+    OLED 0.96" SSD1306, I2C (optional):
+      VCC -> ESP8266 3V3        (3.3 V, NOT 5 V -- the module's pull-ups go
+                                 to whatever powers it, and the ESP8266's
+                                 pins are not 5 V tolerant)
+      GND -> GND
+      SDA -> D7 (GPIO13)
+      SCL -> D4 (GPIO2)
+    Detected automatically at 0x3C or 0x3D. With nothing connected the
+    firmware notices at boot and carries on without it.
 
-    D3/GPIO0 and D7/GPIO13 are deliberately NOT the same pins used for
-    the stepper (D1/D2/D5/D6). D7 has no boot-time role at all, so it's
-    safe for an input that might be held closed at power-on. D3 does have
-    a boot-time role (must read HIGH at reset), but that only matters for
-    an INPUT; as an OUTPUT driving a servo, nothing pulls it low before
-    the sketch starts, so it boots normally.
+    LIMIT_SWITCH (optional) -> MOVED from D7 to D0 (GPIO16):
+      one leg to D0, the other leg to GND, and a 10k resistor from D0 to
+      3V3. D0 has no internal pull-up, so the resistor is required.
+      Then set HAS_LIMIT_SWITCH = true below.
+
+    Why the pins are where they are: D1/D2 are the ESP8266's usual I2C
+    pair but already drive the stepper. D8 must be LOW at boot, so an I2C
+    pull-up on it stops the board booting. D0 is an RTC pin the I2C driver
+    can't use. That leaves D4 and D7 for the display, and pushes the switch
+    to D0. The stepper and servo wiring are unchanged.
+
+    D3 (servo) and D4 (OLED SCL) must both read HIGH at reset. The servo
+    input and the OLED's pull-up both leave them HIGH, so it boots
+    normally. D4 is also the onboard blue LED on most boards -- it will
+    flicker faintly while the display updates. That is harmless.
 
   Before flashing:
     1. Set WIFI_SSID / WIFI_PASSWORD below.
@@ -77,7 +109,10 @@
     3. Tools > Board: e.g. "NodeMCU 1.0 (ESP-12E Module)".
     4. Tools > Flash Size: pick one with an SPIFFS/LittleFS partition.
     5. Library Manager: no extra libraries needed beyond the ESP8266 core
-       (ESP8266WiFi, ESP8266WebServer, LittleFS are all bundled with it).
+       (ESP8266WiFi, ESP8266WebServer, LittleFS, Wire are all bundled).
+       The OLED driver is written into oled_display.h, not a library.
+  6. Keep all three files together in the sketch folder:
+       esp8266_string_art_standalone.ino, web_page.h, oled_display.h
   ----------------------------------------------------------------------
 */
 
@@ -86,7 +121,9 @@
 #include <ESP8266mDNS.h>
 #include <LittleFS.h>
 #include <Servo.h>
+#include <Wire.h>
 #include <vector>
+#include "oled_display.h"   // 0.96" SSD1306 dashboard -- see that file
 
 // ---------------------------------------------------------------------------
 // Explicit prototypes.
@@ -97,6 +134,9 @@
 // page into web_page.h.
 // ---------------------------------------------------------------------------
 bool feederBusy();
+bool limitTriggered();
+void dashTick();
+void dashBoot(const char *l1, const char *l2, const char *l3);
 bool wrapBusy();
 long stepsPerRev();
 long homeStepCap();
@@ -155,7 +195,7 @@ const char *AP_FALLBACK_SSID = "StringArtCNC";
 const char *AP_FALLBACK_PASSWORD = ""; // used only if STA connect fails
 const char *HOSTNAME = "stringart";
 
-// Stepper / driver pins (avoid D0/D3/D4/D8: boot-strapping pins)
+// Stepper / driver pins
 const uint8_t PIN_IN1 = 5;  // D1
 const uint8_t PIN_IN2 = 4;  // D2
 const uint8_t PIN_IN3 = 14; // D5
@@ -164,7 +204,24 @@ const uint8_t PIN_IN4 = 12; // D6
 // Feeder servo (SG90) and home limit switch -- see the wiring notes above
 // for why these two specific pins were picked among the remaining ones.
 const uint8_t PIN_FEEDER_SERVO = 0;  // D3
-const uint8_t PIN_LIMIT_SWITCH = 13; // D7
+
+// The OLED needs two I2C-capable pins. D1/D2 -- the usual I2C pair -- are the
+// stepper. Of the rest, D8 must be LOW at boot (an I2C pull-up stops it
+// booting) and D0 is an RTC pin the I2C driver can't use. That leaves D4, plus
+// D7 -- which is why the limit switch has moved from D7 to D0.
+const uint8_t PIN_OLED_SDA = 13;     // D7
+const uint8_t PIN_OLED_SCL = 2;      // D4 -- held HIGH at boot by the module's pull-up
+
+// Limit switch, now on D0. D0 has no internal pull-up, so fit a 10k resistor
+// from D0 to 3.3V; the switch shorts D0 to GND when triggered, as before.
+// Off by default: an unwired D0 floats, and homing against noise is worse than
+// not homing at all. Set true once the switch and resistor are in.
+const uint8_t PIN_LIMIT_SWITCH = 16; // D0
+const bool HAS_LIMIT_SWITCH = false;
+
+bool limitTriggered() {
+  return HAS_LIMIT_SWITCH && digitalRead(PIN_LIMIT_SWITCH) == LOW;
+}
 
 // ---------------- Motor profile ----------------
 //
@@ -700,6 +757,73 @@ long discOffsetFromNail() {
   return d;
 }
 
+// ---------------- OLED dashboard ----------------
+bool oledFound = false;
+bool oledFlip = false;           // mount the display upside down? persisted
+unsigned long dashNextAt = 0;
+unsigned long bootScreenUntil = 0;
+uint32_t dashLastHash = 0;
+
+String currentIp() {
+  return WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString()
+                                       : WiFi.softAPIP().toString();
+}
+
+void dashBoot(const char *l1, const char *l2, const char *l3) {
+  if (!oledFound) return;
+  oled::renderBoot(l1, l2, l3);
+  oled::flushAll();
+}
+
+// Redraws at most twice a second, never while the disc is moving, and only
+// sends the frame when something on it actually changed -- the SSD1306 does
+// not need 1 KB over I2C just to show the same numbers again.
+void dashTick() {
+  if (!oledFound) return;
+  if (stepping) return;                       // never hold up a move
+  if (!oled::flushing() && millis() >= bootScreenUntil &&
+      (long)(millis() - dashNextAt) >= 0) {
+    dashNextAt = millis() + 500;
+
+    oled::Dash d;
+    d.alert = false;
+    if (homing)                d.status = "HOMING";
+    else if (calRunning)       d.status = "CALIBRATE";
+    else if (homeError)      { d.status = "HOME FAIL"; d.alert = true; }
+    else if (!positionKnown) { d.status = "CHECK POS"; d.alert = true; }
+    else if (wrapBusy())       d.status = "WRAP";
+    else if (feederBusy())     d.status = "FEED";
+    else if (autoRunning)      d.status = "RUN";
+    else if (sequence.empty()) d.status = "READY";
+    else if (currentIndex + 1 >= (int)sequence.size()) d.status = "DONE";
+    else                       d.status = "PAUSED";
+
+    d.total = (int)sequence.size();
+    d.index = currentIndex;
+    d.current = sequence.empty() ? -1 : sequence[currentIndex];
+    d.next = (currentIndex + 1 < (int)sequence.size()) ? sequence[currentIndex + 1] : -1;
+
+    // A true countdown while running: nails left at the measured rate, less
+    // however long the current nail has already been going. Frozen when paused.
+    d.remainSec = -1;
+    if (avgNailMs > 0 && d.total > 0) {
+      long left = (long)(d.total - d.index - 1);
+      long ms = left * (long)avgNailMs;
+      if (autoRunning && lastNailAt) ms -= (long)(millis() - lastNailAt);
+      d.remainSec = ms > 0 ? ms / 1000 : 0;
+    }
+
+    String ip = currentIp();
+    d.ip = ip.c_str();
+    oled::renderDash(d);
+
+    uint32_t h = 2166136261u;                 // FNV-1a over the frame
+    for (uint16_t i = 0; i < sizeof(oled::buf); i++) h = (h ^ oled::buf[i]) * 16777619u;
+    if (h != dashLastHash) { dashLastHash = h; oled::markDirty(); }
+  }
+  oled::service();
+}
+
 void startHoming(int8_t dir) {
   homing = true;
   homeError = false;
@@ -756,13 +880,13 @@ void loadState() {
 void saveConfig() {
   File f = LittleFS.open(CONFIG_FILE, "w");
   if (!f) return;
-  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%ld\n%ld\n%u\n",
+  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%ld\n%ld\n%u\n%u\n",
            numNails, stepDelayMs, (unsigned long)autoAdvanceMs,
            feederRestAngle, feederFeedAngle, feederPulseMs, feederAutoFeed ? 1u : 0u,
            (int)dirSign, feederSettleMs, feederRecoverMs, autoHomeOnBoot ? 1u : 0u,
            wrapMode ? 1u : 0u, wrapSteps, (int)wrapDir,
            wrapSweep, wrapHoldInMs, wrapHoldSweepMs, servoSlewDeg, servoSlewMs,
-           stepsPerRevX100, nailOffsetSteps, rehomeEvery);
+           stepsPerRevX100, nailOffsetSteps, rehomeEvery, oledFlip ? 1u : 0u);
   f.close();
 }
 
@@ -804,6 +928,7 @@ void loadConfig() {
   stepsPerRevX100 = readConfigLine(f, stepsPerRevX100);
   nailOffsetSteps = readConfigLine(f, nailOffsetSteps);
   rehomeEvery = (uint16_t)readConfigLine(f, rehomeEvery);
+  oledFlip = readConfigLine(f, oledFlip ? 1 : 0) != 0;
   if (stepsPerRevX100 < 1000) stepsPerRevX100 = STEPS_PER_REV_X100_DEF;
   f.close();
   if (numNails == 0) numNails = DEF_NUM_NAILS;
@@ -916,8 +1041,10 @@ void handleStatus() {
   json += "\"avgNailMs\":" + String(avgNailMs) + ",";
   json += "\"elapsedMs\":" + String(runElapsedMs) + ",";
   json += "\"calRunning\":" + String(calRunning ? "true" : "false") + ",";
-  json += "\"hasLimitSwitch\":" + String(PIN_LIMIT_SWITCH >= 0 ? "true" : "false") + ",";
-  json += "\"switchTriggered\":" + String(digitalRead(PIN_LIMIT_SWITCH) == LOW ? "true" : "false") + ",";
+  json += "\"hasLimitSwitch\":" + String(HAS_LIMIT_SWITCH ? "true" : "false") + ",";
+  json += "\"switchTriggered\":" + String(limitTriggered() ? "true" : "false") + ",";
+  json += "\"oledAddr\":" + String(oledFound ? (int)oled::addr : 0) + ",";
+  json += "\"oledFlip\":" + String(oledFlip ? "true" : "false") + ",";
   json += "\"homing\":" + String(homing ? "true" : "false") + ",";
   json += "\"wrapMode\":" + String(wrapMode ? "true" : "false") + ",";
   json += "\"wrapSteps\":" + String(wrapSteps) + ",";
@@ -1005,6 +1132,11 @@ void handleConfig() {
   if (server.hasArg("servoSlewDeg")) { servoSlewDeg = (uint8_t)server.arg("servoSlewDeg").toInt(); if (servoSlewDeg < 1) servoSlewDeg = 1; }
   if (server.hasArg("servoSlewMs")) servoSlewMs = (uint16_t)server.arg("servoSlewMs").toInt();
   if (server.hasArg("rehomeEvery")) rehomeEvery = (uint16_t)server.arg("rehomeEvery").toInt();
+  if (server.hasArg("oledFlip")) {
+    oledFlip = server.arg("oledFlip").toInt() != 0;
+    oled::setFlip(oledFlip);
+    dashLastHash = 0;          // force a redraw the right way up
+  }
   if (server.hasArg("feederAutoFeed")) feederAutoFeed = server.arg("feederAutoFeed").toInt() != 0;
   saveConfig();
   if (!feederBusy() && !wrapBusy()) servoSnapTo(feederRestAngle); // show a new rest angle at once
@@ -1048,6 +1180,14 @@ void handleAction() {
     saveState();
   } else if (cmd == "findhome") {
     abortWrap();
+    if (!HAS_LIMIT_SWITCH) {
+      // Nothing to home against: seeking would just spin a turn and a quarter
+      // and report failure. Refuse up front instead.
+      homeError = true;
+      sendCorsHeaders();
+      server.send(200, "text/plain", "no limit switch");
+      return;
+    }
     // Physically verified homing: slowly seek until the limit switch trips.
     int8_t dir = (server.hasArg("value") && server.arg("value").toInt() < 0) ? -1 : 1;
     startHoming(dir);
@@ -1183,10 +1323,16 @@ void setup() {
   pinMode(PIN_IN4, OUTPUT);
   coilsOff();
 
-  pinMode(PIN_LIMIT_SWITCH, INPUT_PULLUP);
+  if (HAS_LIMIT_SWITCH) pinMode(PIN_LIMIT_SWITCH, INPUT);   // external 10k pull-up
 
   LittleFS.begin();
   loadConfig();
+
+  // Display comes up straight after config so the flip setting is known, and
+  // before WiFi so there is something on screen during the up-to-15 s join.
+  oledFound = oled::begin(PIN_OLED_SDA, PIN_OLED_SCL, oledFlip);
+  Serial.println(oledFound ? "OLED found" : "No OLED on D7/D4 -- carrying on without it");
+  dashBoot("Joining WiFi", WIFI_SSID, "please wait");
   if (wrapSteps == 0 || wrapSweep == 0) applyAutoWrapGeometry();
   loadSequenceFromFile();
   loadState();
@@ -1201,7 +1347,7 @@ void setup() {
   // re-establishes an absolute zero, then drives back to the saved nail. The
   // disc is deliberately NOT set running again -- thread may be loose, and
   // starting an unattended machine on power-up is a bad default.
-  if (autoHomeOnBoot && !sequence.empty()) {
+  if (autoHomeOnBoot && HAS_LIMIT_SWITCH && !sequence.empty()) {
     resumeAfterHome = true;
     startHoming(1);
   }
@@ -1210,6 +1356,16 @@ void setup() {
   servoSnapTo(feederRestAngle);
 
   setupWiFi();
+
+  // The one thing nobody can find without a serial monitor: the address.
+  {
+    bool sta = WiFi.status() == WL_CONNECTED;
+    String ip = currentIp();
+    dashBoot(sta ? "WiFi connected" : "Own network:",
+             sta ? ip.c_str() : AP_FALLBACK_SSID,
+             sta ? (String(HOSTNAME) + ".local").c_str() : ip.c_str());
+    bootScreenUntil = millis() + 8000;
+  }
 
   server.on("/", handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
@@ -1234,7 +1390,7 @@ void loop() {
     // wiring, a switch that never closes, etc.) rather than spin forever.
     if (millis() - lastStepAt >= stepDelayMs) {
       lastStepAt = millis();
-      if (digitalRead(PIN_LIMIT_SWITCH) == LOW) {
+      if (limitTriggered()) {
         currentStep = 0;
         targetStep = 0;
         stepping = false;
@@ -1300,7 +1456,7 @@ void loop() {
       currentIndex++;
       // Periodic re-home wipes accumulated missed steps. Progress is kept, so
       // it picks straight back up on the same chord.
-      if (rehomeEvery > 0 && PIN_LIMIT_SWITCH >= 0 && ++sinceRehome >= rehomeEvery) {
+      if (rehomeEvery > 0 && HAS_LIMIT_SWITCH && ++sinceRehome >= rehomeEvery) {
         sinceRehome = 0;
         resumeAfterHome = true;
         startHoming(1);
@@ -1333,4 +1489,6 @@ void loop() {
   serviceWrap();
   // Servo slew: walks the arm toward its target one increment at a time
   serviceServo();
+  // OLED: redraw if anything changed, one page per pass, never mid-move
+  dashTick();
 }

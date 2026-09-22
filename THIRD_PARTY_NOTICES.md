@@ -89,7 +89,7 @@ POSSIBILITY OF SUCH DAMAGE.
   page) is adapted from this design.
 - **Licence:** not stated in the copy this project was built from.
 
-This entry is Chanchal Sakarde own work, and you can relicense
+If you are Chanchal Sakarde, this entry is your own work, and you can relicense
 it under the GPL along with the rest of the project. If you are not, confirm
 the author's permission before publishing — adapting someone's work into a GPL
 project needs either a compatible licence from them or their agreement. The

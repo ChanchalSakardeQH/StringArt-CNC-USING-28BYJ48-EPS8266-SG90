@@ -1,6 +1,121 @@
 # Changelog
 
-All notable changes to the ESP8266 String Art Indexer are recorded here.
+All notable changes to the ESP8266 String Art CNC are recorded here.
+
+---
+
+## [1.14.1] — 2026-09-22
+
+### Fixed
+
+- **Start Auto did nothing after a calibration spin.** Pressing **Spin** in the
+  calibration panel set a "calibration running" flag that only **Correct**
+  cleared. Auto-run waits while that flag is set, so if you spun the disc to
+  check it and moved on without pressing Correct, Start Auto switched auto on
+  and then advanced no nails at all — and nothing on the page said why. The
+  same flag froze the servo-angle sliders. The flag now clears the moment the
+  spin finishes; Correct still works afterwards, for as long as you like.
+  Reproduced in the real firmware before fixing: auto on, 0 nails advanced.
+  After: all nails advanced.
+
+- **Start Auto looked broken at the end of a sequence.** On a finished
+  sequence it switched auto on with nothing left to do. It now refuses and says
+  so: "The sequence is finished. Use Go to step # to start again." It also
+  refuses, with a reason, when no sequence is loaded.
+
+- **Stop** now also cancels a calibration spin in progress.
+
+### Changed
+
+- **The first move starts as soon as you press Start Auto**, rather than after
+  a full dwell, so it's obvious the button worked.
+
+- **The page says why auto isn't moving.** A line under the button shows a
+  refused Start's reason, or whatever a running auto is waiting on: a
+  checkpoint answer, a calibration spin, or homing. The rule behind it: every
+  thing auto-run waits on must be visible, or a paused machine is
+  indistinguishable from a broken button. `autoNote`, `autoBlock` and
+  `calAwaiting` added to `/status`.
+
+- The calibration panel tells you when a spin has finished and is waiting for
+  its Correct, and that auto-run isn't held up meanwhile.
+
+### Added
+
+- `tests/auto_start.cpp` — regression tests for all of the above, run against
+  the real firmware.
+- A web page test that loads the real page in `jsdom`, feeds it the firmware's
+  real `/status` reply, and clicks Start and Stop Auto. Optional; needs
+  `npm install jsdom` in `tests/`.
+
+### Removed
+
+- Five stray `o_*.pbm` images from an OLED driver test, which had been shipped
+  in the repository root by mistake. `*.pbm` is now in `.gitignore`. If they're
+  in your repo: `git rm o_*.pbm`.
+
+---
+
+## [1.14.0] — 2026-09-21
+
+### Added
+
+- **Checkpoint test run** (off by default). Every Nth nail the disc stops *on*
+  the nail, before wrapping, and asks whether it's centred in front of the
+  feeder. Answer yes, nudge it to centre first (±1 step or ±1 nail), type the
+  nail that's actually there, or skip. The answer re-syncs the numbering, then
+  the machine wraps that nail and carries on.
+
+- **Learning from the answers.** Each answer is recorded as the total
+  correction so far against the net steps turned since the last home. A
+  least-squares line through the points separates a constant offset (the
+  intercept) from a wrong steps-per-turn figure (the slope). Once there are 5
+  checkpoints over 2 turns with at least two nails' worth of drift, it corrects
+  steps-per-turn — automatically by default, or on request. Answers that don't
+  fit a line are reported as missed steps, which can't be learned.
+
+- The OLED shows **CONFIRM?** and the browser tab a ● marker while a question
+  is waiting. The page's panel shows checkpoints, corrections, offset, drift,
+  fit quality, the suggestion, and what happened last.
+
+- `verify`, `learnapply` and `learnforget` actions; checkpoint and learning
+  fields in `/status`; `verifyEvery`, `learnAutoSpr` and the pre-learning
+  steps-per-turn persisted in `/config.txt` (three more lines).
+
+- **`tests/`**: stand-ins for the ESP8266 core's headers, so the whole
+  firmware compiles on a PC with all warnings on, and an end-to-end test that
+  runs the real `setup()`, `loop()` and web handlers against a simulated disc.
+  `sh tests/run.sh` runs both.
+
+### Notes
+
+- **The whole sketch was compiled for the first time**, rather than in
+  extracted pieces: no errors and no warnings with `-Wall -Wextra`.
+
+- **Tested end to end in the real firmware.** 600-nail runs with a checkpoint
+  every 25, nail nudged to centre before each answer: steps-per-turn learned as
+  4075.65 for a true 4075.77, and 4109.94 for a true 4110.00, at the 6th
+  checkpoint both times, with 0 of the last 200 nails wrong. With a motor that
+  was already right, it changed nothing. Runs with wrapping on and off both
+  finish every nail.
+
+- **Centring matters.** With whole-nail answers only, up to 30% of nails were
+  still wrong at the end: a whole-nail answer can leave the disc half a nail
+  off. The page says so beside the Yes button.
+
+- **The correction is steps/turn × (1 + slope).** The textbook-looking
+  steps/turn ÷ (1 + slope) is wrong here — corrections are applied to the
+  offset, which flips the sign — and would have doubled the drift instead of
+  removing it. Caught in simulation before shipping, and checked for both
+  rotation directions and several nail counts.
+
+- A "yes" re-syncs to wherever the disc is at that moment, so nudging before
+  answering counts as the correction. Under the earlier logic a nudge would
+  have been ignored, leaving 99% of later nails wrong.
+
+- Switching checkpoints off while a question is on screen finishes that nail's
+  wrap rather than skipping the chord. Restore defaults leaves an open question
+  on screen for the same reason.
 
 ---
 
@@ -739,7 +854,9 @@ behaviour has changed.
 - The page grew by roughly 9 KB of PROGMEM. On a 4 MB ESP8266 there is ample
   room; on a 1 MB module check the build size after flashing.
 
+---
 
+## [1.1.0] — 2026-09-14
 
 The indexer was presenting the wrong nail. Asking for nail 258 brought nail
 102 to the feeder; 109 brought 251; 263 brought 97; 179 brought 181. Every

@@ -240,6 +240,18 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
   .eta-grid > div{ display:flex; flex-direction:column; }
   .eta-k{ font-size:.66rem; letter-spacing:.06em; text-transform:uppercase; color:var(--text-dim); }
   .eta-v{ font-size:.94rem; color:var(--text); }
+  .verify-card{
+    border:2px solid var(--copper); border-radius:10px; padding:12px 12px 4px;
+    margin:4px 0 16px; background:var(--bg);
+    animation: verifyPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes verifyPulse{ 50%{ box-shadow:0 0 0 4px rgba(184,115,51,.18); } }
+  .verify-q{ font-size:.95rem; line-height:1.4; margin-bottom:10px; }
+  .verify-q b{ font-family:"IBM Plex Mono",monospace; font-size:1.15rem; }
+  .auto-note{
+    font-size:.8rem; line-height:1.45; margin:-4px 0 12px; padding:7px 10px;
+    border-radius:7px; border:1px solid var(--warn); background:var(--bg); color:var(--text);
+  }
   .legal{
     margin-top:22px; padding-top:12px; border-top:1px solid var(--border);
     font-size:.72rem; line-height:1.55; color:var(--text-dim);
@@ -392,6 +404,29 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       <div><span class="eta-k">per nail</span><span class="eta-v" id="etaPer">--</span></div>
     </div>
 
+    <!-- Checkpoint question. Only appears during a checkpoint test run. -->
+    <div class="verify-card" id="verifyCard" hidden>
+      <div class="verify-q">Checkpoint: is nail <b id="verifyNailNo">&mdash;</b>
+        centred in front of the feeder?</div>
+      <div class="jog-row">
+        <button class="ghost" data-vjog="-n">&minus;1 nail</button>
+        <button class="ghost" data-vjog="-1">&minus;1 step</button>
+        <button class="ghost" data-vjog="1">+1 step</button>
+        <button class="ghost" data-vjog="n">+1 nail</button>
+      </div>
+      <div class="stat-line">Nudge until it's centred, then say yes. Centring
+        matters: it's what lets the machine learn the real steps per turn.</div>
+      <button class="primary" id="verifyYesBtn">Yes, it's centred</button>
+      <div class="field" style="margin-top:10px">
+        <label>Far out? The nail at the feeder is actually #</label>
+        <div class="btn-pair">
+          <input id="verifyOtherVal" type="number" min="0">
+          <button class="secondary" id="verifyOtherBtn" style="width:auto;flex:none;padding:8px 16px">Use</button>
+        </div>
+      </div>
+      <button class="ghost" id="verifySkipBtn">Skip this checkpoint</button>
+    </div>
+
     <div class="btn-pair">
       <button class="secondary" id="idxPrevBtn">&larr; Prev</button>
       <button class="primary" id="idxNextBtn" style="margin-bottom:0">Next &rarr;</button>
@@ -400,6 +435,7 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
       <button class="secondary" id="idxAutoBtn">Start Auto</button>
       <button class="danger" id="idxHomeBtn">Set Home</button>
     </div>
+    <div class="auto-note" id="idxAutoNote" hidden></div>
     <button class="secondary" id="idxFindHomeBtn" style="margin-top:8px">Find Home (limit switch)</button>
     <div class="idx-sub" id="idxSwitchText">limit switch: &mdash;</div>
 
@@ -482,6 +518,33 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
         <input id="calRehome" type="number" min="0" max="2000" step="10">
       </div>
       <div class="stat-line" id="calRehomeText">&mdash;</div>
+
+      <hr>
+
+      <p class="idx-sub" style="text-align:left">
+        <b>Checkpoint test run.</b> During a run, the machine stops on every
+        Nth nail and asks whether it's the right one. Your answers correct the
+        run straight away, and it learns from them: a constant error becomes a
+        position correction, and an error that grows as the disc turns becomes
+        a steps-per-turn correction. Off by default.
+      </p>
+      <div class="switch-row">
+        <span>Pause to check the nail during a run</span>
+        <label class="switch"><input type="checkbox" id="verifyOn"><span class="slider"></span></label>
+      </div>
+      <div class="field">
+        <label>Every <span class="val">nails</span></label>
+        <input id="verifyEveryVal" type="number" min="5" max="500" step="5" value="25">
+      </div>
+      <div class="switch-row">
+        <span>Correct steps per turn automatically</span>
+        <label class="switch"><input type="checkbox" id="learnAutoOn"><span class="slider"></span></label>
+      </div>
+      <div class="sync-box" id="learnBox">&mdash;</div>
+      <div class="btn-pair">
+        <button class="ghost" id="learnApplyBtn">Use suggested steps per turn</button>
+        <button class="ghost" id="learnForgetBtn">Forget what it learned</button>
+      </div>
     </details>
 
     <hr>
@@ -1463,6 +1526,7 @@ window.NailCount = (function(){
   }
   const idxBar = document.getElementById("idxBar");
   const idxAutoBtn = document.getElementById("idxAutoBtn");
+  const idxAutoNote = document.getElementById("idxAutoNote");
   const idxNumNails = document.getElementById("idxNumNails");
   const idxStepDelay = document.getElementById("idxStepDelay");
   const idxAutoMs = document.getElementById("idxAutoMs");
@@ -1489,6 +1553,19 @@ window.NailCount = (function(){
   const calStepsText = document.getElementById("calStepsText");
   const calRehome = document.getElementById("calRehome");
   const calRehomeText = document.getElementById("calRehomeText");
+  const verifyCard = document.getElementById("verifyCard");
+  const verifyNailNo = document.getElementById("verifyNailNo");
+  const verifyYesBtn = document.getElementById("verifyYesBtn");
+  const verifyOtherVal = document.getElementById("verifyOtherVal");
+  const verifyOtherBtn = document.getElementById("verifyOtherBtn");
+  const verifySkipBtn = document.getElementById("verifySkipBtn");
+  const verifyOn = document.getElementById("verifyOn");
+  const verifyEveryVal = document.getElementById("verifyEveryVal");
+  const learnAutoOn = document.getElementById("learnAutoOn");
+  const learnBox = document.getElementById("learnBox");
+  const learnApplyBtn = document.getElementById("learnApplyBtn");
+  const learnForgetBtn = document.getElementById("learnForgetBtn");
+  const baseTitle = document.title;
   const wrapMode = document.getElementById("wrapMode");
   const wrapSteps = document.getElementById("wrapSteps");
   const wrapDirFlip = document.getElementById("wrapDirFlip");
@@ -1629,6 +1706,7 @@ window.NailCount = (function(){
       syncField(servoSlewMs, j.servoSlewMs);
       syncField(calRehome, j.rehomeEvery);
       renderCal(j);
+      renderVerify(j);
       renderWrapBreakdown(j);
 
       // Shown only when the saved position could not be trusted at boot.
@@ -1648,6 +1726,10 @@ window.NailCount = (function(){
       if (document.activeElement !== idxReverseDir) idxReverseDir.checked = (j.dirSign < 0);
       idxAutoOn = j.autoRunning;
       idxAutoBtn.textContent = idxAutoOn ? "Stop Auto" : "Start Auto";
+      // Why auto isn't moving -- a refused Start, or whatever it's waiting on.
+      const why = j.autoBlock || j.autoNote || "";
+      idxAutoNote.hidden = !why;
+      idxAutoNote.textContent = why;
       idxFindHomeBtn.disabled = j.homing;
       idxSwitchText.textContent = "limit switch: " + (j.switchTriggered ? "TRIGGERED" : "open") +
         (j.homing ? "  (homing…)" : "") +
@@ -1718,6 +1800,95 @@ window.NailCount = (function(){
     if (Number.isFinite(v)) idxAct("calreport", v);
   });
 
+  // ---- checkpoint test run ----------------------------------------------
+  function postConfig(body) {
+    return fetch("/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    }).then(refreshIndexer);
+  }
+
+  verifyOn.addEventListener("change", () =>
+    postConfig("verifyEvery=" + (verifyOn.checked ? (parseInt(verifyEveryVal.value, 10) || 25) : 0)));
+  verifyEveryVal.addEventListener("change", () => {
+    if (verifyOn.checked) postConfig("verifyEvery=" + (parseInt(verifyEveryVal.value, 10) || 25));
+  });
+  learnAutoOn.addEventListener("change", () =>
+    postConfig("learnAutoSpr=" + (learnAutoOn.checked ? 1 : 0)));
+
+  // Nudge buttons: a nail is whatever the current nail pitch works out to.
+  document.querySelectorAll("[data-vjog]").forEach(b => b.addEventListener("click", () => {
+    const k = b.dataset.vjog;
+    const n = Math.max(1, Math.round(stepsPerNail));
+    idxAct("jog", k === "n" ? n : k === "-n" ? -n : parseInt(k, 10));
+  }));
+  verifyYesBtn.addEventListener("click", () => idxAct("verify", -1));
+  verifySkipBtn.addEventListener("click", () => idxAct("verify", -2));
+  verifyOtherBtn.addEventListener("click", () => {
+    const v = parseInt(verifyOtherVal.value, 10);
+    if (Number.isFinite(v) && v >= 0) { idxAct("verify", v); verifyOtherVal.value = ""; }
+  });
+  verifyOtherVal.addEventListener("keydown", (e) => { if (e.key === "Enter") verifyOtherBtn.click(); });
+  learnApplyBtn.addEventListener("click", () => idxAct("learnapply"));
+  learnForgetBtn.addEventListener("click", () => idxAct("learnforget"));
+
+  function renderVerify(j) {
+    // The question: only once the disc has actually stopped on the nail.
+    const asking = j.verifyPending && !j.moving;
+    verifyCard.hidden = !asking;
+    if (asking) verifyNailNo.textContent = j.verifyNail;
+    // A marker in the tab title, since a run can go a long time between
+    // questions and you may be in another tab.
+    document.title = asking ? "\u25CF Check nail " + j.verifyNail : baseTitle;
+
+    if (document.activeElement !== verifyOn) verifyOn.checked = j.verifyEvery > 0;
+    if (j.verifyEvery > 0 && document.activeElement !== verifyEveryVal)
+      verifyEveryVal.value = j.verifyEvery;
+    if (document.activeElement !== learnAutoOn) learnAutoOn.checked = j.learnAutoSpr;
+
+    const spr = j.stepsPerRevX100 / 100;
+    const pitch = spr / j.numNails;
+    learnApplyBtn.disabled = !(j.learnSuggestX100 > 0) || j.learnSuggestX100 === j.stepsPerRevX100;
+    learnForgetBtn.disabled = !(j.learnPoints > 0 || j.learnBaseSprX100 > 0);
+
+    if (j.verifyEvery === 0 && j.learnPoints === 0) {
+      learnBox.className = "sync-box";
+      learnBox.innerHTML = "<span class=\"dim\">Off. Turn it on for a test run and start " +
+        "the sequence; it will stop every " + (parseInt(verifyEveryVal.value, 10) || 25) +
+        " nails and ask.</span>" +
+        (j.learnBaseSprX100 > 0 ? "<br>Steps per turn was learned earlier: " +
+          (j.learnBaseSprX100 / 100).toFixed(2) + " \u2192 " + spr.toFixed(2) + "." : "");
+      return;
+    }
+
+    let html = "<b>" + j.learnChecks + "</b> checkpoint" + (j.learnChecks === 1 ? "" : "s") +
+      ", <b>" + j.learnFixes + "</b> needed a correction.<br>";
+    if (j.learnPoints >= 2) {
+      html += "<span class=\"dim\">Constant offset " + (+j.learnOffset).toFixed(1) +
+        " steps \u00b7 drift " + j.learnDriftPpm + " ppm over " +
+        (+j.learnSpanTurns).toFixed(1) + " turns \u00b7 fit \u00b1" +
+        (+j.learnRms).toFixed(1) + " steps</span><br>";
+    }
+    let tone = "exact";
+    if (j.learnSuggestX100 > 0 && j.learnSuggestX100 !== j.stepsPerRevX100) {
+      html += "Suggests <b>" + (j.learnSuggestX100 / 100).toFixed(2) + "</b> steps per turn " +
+        "(now " + spr.toFixed(2) + ")" + (j.learnAutoSpr ? " \u2014 applying at the next checkpoint." : ".");
+    } else if (j.learnPoints >= 5 && j.learnRms > 0.5 * pitch) {
+      tone = "approx";
+      html += "<b>Your answers don't fall on a line.</b> That points to missed steps, which " +
+        "can't be learned. Check nothing is binding, and try a longer step delay.";
+    } else if (j.learnPoints < 5 || j.learnSpanTurns < 2) {
+      html += "<span class=\"dim\">Needs at least 5 checkpoints over 2 turns of travel before " +
+        "it can tell drift from a one-off offset.</span>";
+    } else {
+      html += "Steps per turn looks right. Nothing to learn.";
+    }
+    if (j.learnNote) html += "<br><span class=\"dim\">Last: " + j.learnNote + "</span>";
+    learnBox.className = "sync-box " + tone;
+    learnBox.innerHTML = html;
+  }
+
   function renderCal(j){
     stepsPerNail = (j.stepsPerRevX100 / 100) / j.numNails;
     calJogUnit.textContent =
@@ -1730,18 +1901,25 @@ window.NailCount = (function(){
       : "Correction: " + j.nailOffsetSteps + " steps (" +
         offNails.toFixed(2) + " nails).";
 
-    const now = j.stepsPerRevX100 / 100;
-    const def = j.stepsPerRevDefX100 / 100;
-    const drift = (now - def) / def * 100;
-    calStepsText.className = "sync-box " + (Math.abs(drift) > 3 ? "approx" : "exact");
-    calStepsText.innerHTML =
-      "<b>" + now.toFixed(2) + "</b> steps per turn " +
-      "<span class=\"dim\">(compiled default " + def.toFixed(2) + ", " +
-      (drift >= 0 ? "+" : "") + drift.toFixed(2) + "%)</span><br>" +
-      "<span class=\"dim\">One nail out after " +
-      (Math.abs(drift) < 0.001 ? "\u221e" :
-        Math.round(100 / Math.abs(drift) / j.numNails * 100) / 100 + " turns") +
-      " of accumulated error at this figure.</span>";
+    if (j.calAwaiting) {
+      calStepsText.className = "sync-box approx";
+      calStepsText.innerHTML = "<b>Spin finished.</b> Count how many nails past the " +
+        "start it ended, enter it above, and press Correct. (Enter 0 if it came back " +
+        "exactly.) Auto-run is not held up while you do.";
+    } else {
+      const now = j.stepsPerRevX100 / 100;
+      const def = j.stepsPerRevDefX100 / 100;
+      const drift = (now - def) / def * 100;
+      calStepsText.className = "sync-box " + (Math.abs(drift) > 3 ? "approx" : "exact");
+      calStepsText.innerHTML =
+        "<b>" + now.toFixed(2) + "</b> steps per turn " +
+        "<span class=\"dim\">(compiled default " + def.toFixed(2) + ", " +
+        (drift >= 0 ? "+" : "") + drift.toFixed(2) + "%)</span><br>" +
+        "<span class=\"dim\">One nail out after " +
+        (Math.abs(drift) < 0.001 ? "\u221e" :
+          Math.round(100 / Math.abs(drift) / j.numNails * 100) / 100 + " turns") +
+        " of accumulated error at this figure.</span>";
+    }
 
     calRehomeText.textContent = !j.hasLimitSwitch
       ? "No limit switch fitted, so this cannot run."

@@ -134,6 +134,7 @@
 // page into web_page.h.
 // ---------------------------------------------------------------------------
 bool feederBusy();
+String autoBlock();
 bool limitTriggered();
 void dashTick();
 void dashBoot(const char *l1, const char *l2, const char *l3);
@@ -155,7 +156,13 @@ long wrapSweepSteps();
 void saveState();
 void noteNailDone();
 long wrapLeadSteps();
-void startWrap(uint16_t nail);
+void startWrap(uint16_t nail, int8_t forceDir = 0);
+void learnReset();
+void learnFit();
+void learnApplySpr(long newX100, uint16_t atFeeder);
+void startVerify(uint16_t nail, bool doFeed);
+void finishVerify();
+void verifyAnswer(long v);
 void serviceWrap();
 void abortWrap();
 void presentNail(uint16_t nail, bool doFeed);
@@ -618,7 +625,7 @@ long wrapSignedSweep() { return wrapSweepMag() * wrapApproachDir * wrapDir; }
 long wrapLeadSteps() { return wrapSignedLead(); }
 long wrapSweepSteps() { return wrapSignedSweep(); }
 
-void startWrap(uint16_t nail) {
+void startWrap(uint16_t nail, int8_t forceDir) {
   wrapTargetNail = nail;
 
   // Work out which way the disc is about to travel, before moving, and hand the
@@ -628,7 +635,8 @@ void startWrap(uint16_t nail) {
   long delta = nailToStep(nail) - currentStep;
   while (delta >  stepsPerRev() / 2) delta -= stepsPerRev();
   while (delta < -stepsPerRev() / 2) delta += stepsPerRev();
-  if (delta != 0) wrapApproachDir = (delta > 0) ? 1 : -1;
+  if (forceDir != 0) wrapApproachDir = forceDir;     // after a checkpoint the disc is
+  else if (delta != 0) wrapApproachDir = (delta > 0) ? 1 : -1;   // already on the nail
 
   wrapPhase = WRAP_APPROACH;
   wrapNextAt = millis();
@@ -730,9 +738,205 @@ void serviceFeeder() {
 }
 
 // ---- Homing (non-blocking seek toward the limit switch) -------------------
+// ---------------- Checkpoints and learning ----------------
+//
+// Off by default. When on, every Nth nail the disc stops ON the nail -- before
+// wrapping -- and asks whether that nail really is in front of the feeder. The
+// answer does two things:
+//
+//  1. Fixes the run now. A wrong answer re-syncs the numbering (the same
+//     correction as "The nail at the feeder is actually #"), then carries on.
+//  2. Learns. Every answer is a data point: the total correction applied so
+//     far, against the net steps the disc has turned since the last reference.
+//     Positioning is absolute, so only two kinds of error can be learned:
+//        a constant offset            -> shows up as the intercept
+//        a wrong steps-per-turn figure -> an error that grows with net travel
+//     A least-squares line through the points separates them. When the line
+//     is trustworthy, steps-per-turn is corrected, and missed steps -- which
+//     are random and can't be learned -- show up as a poor fit instead.
+//
+// The correction is steps/turn x (1 + slope). The obvious-looking
+// steps/turn / (1 + slope) is WRONG here: corrections are applied to the
+// offset, which flips the sign, and that version doubles the drift instead of
+// removing it. Checked in simulation against the firmware's own maths, for
+// both rotation directions and several nail counts.
+uint16_t verifyEvery = 0;       // ask every N nails; 0 = off. Persisted.
+bool learnAutoSpr = true;       // correct steps/turn automatically when confident. Persisted.
+uint16_t sinceVerify = 0;
+bool verifyPending = false;
+uint16_t verifyNail = 0;
+int8_t verifyDir = 1;           // which way the chord ran, for the wrap that follows
+bool verifyDoFeed = false;
+
+long netSteps = 0;              // signed, unwrapped steps since the last reference
+
+const uint8_t LEARN_MAX = 24;
+long learnX[LEARN_MAX];
+long learnE[LEARN_MAX];
+uint8_t learnN = 0;
+long learnCum = 0;              // total correction applied this session, in steps
+long learnBaseSprX100 = 0;      // steps/turn before learning first changed it; 0 = untouched
+double learnA = 0, learnB = 0, learnRms = 0, learnSpanTurns = 0;
+long learnSuggestX100 = 0;      // 0 = nothing to suggest yet
+bool learnConfident = false;
+uint16_t learnChecks = 0, learnFixes = 0;
+String learnNote = "";          // what it last did, in words, for the page
+
+// A new absolute reference (a home, or a manual re-sync) starts a new session:
+// old points were measured against a different zero and can't be mixed in.
+void learnReset() {
+  learnN = 0; learnCum = 0; netSteps = 0;
+  learnA = learnB = learnRms = learnSpanTurns = 0;
+  learnSuggestX100 = 0; learnConfident = false;
+  learnChecks = learnFixes = 0;
+}
+
+void learnFit() {
+  learnSuggestX100 = 0;
+  learnConfident = false;
+  if (learnN < 2) { learnA = learnN ? learnE[0] : 0; learnB = 0; learnRms = 0; return; }
+
+  double sx = 0, sy = 0, sxx = 0, sxy = 0;
+  long xmin = learnX[0], xmax = learnX[0];
+  for (uint8_t i = 0; i < learnN; i++) {
+    double x = learnX[i], y = learnE[i];
+    sx += x; sy += y; sxx += x * x; sxy += x * y;
+    if (learnX[i] < xmin) xmin = learnX[i];
+    if (learnX[i] > xmax) xmax = learnX[i];
+  }
+  double n = learnN, den = n * sxx - sx * sx;
+  learnSpanTurns = (xmax - xmin) / (double)stepsPerRev();
+  if (den <= 0 || learnSpanTurns < 0.5) {
+    // Not enough spread in travel to see drift; everything is offset.
+    learnA = sy / n; learnB = 0;
+  } else {
+    learnB = (n * sxy - sx * sy) / den;
+    learnA = (sy - learnB * sx) / n;
+  }
+  double ss = 0;
+  for (uint8_t i = 0; i < learnN; i++) {
+    double r = learnE[i] - (learnA + learnB * learnX[i]);
+    ss += r * r;
+  }
+  learnRms = sqrt(ss / n);
+
+  // Only trust the slope when all of these hold. Answers come in whole nails,
+  // so a couple of points can suggest a trend that is really just rounding.
+  double pitch = stepsPerRevX100 / 100.0 / numNails;
+  // Tuned in simulation against the firmware's own maths: 5 points over two
+  // turns, and at least two nails' worth of drift, before a slope is believed.
+  // With a correct motor these never trigger, so it never "learns" noise.
+  bool enough = learnN >= 5 && learnSpanTurns >= 2.0;
+  bool fits   = learnRms <= 0.5 * pitch;                 // the line explains the answers
+  bool real   = fabs(learnB) * (xmax - xmin) >= 2 * pitch;
+  bool sane   = fabs(learnB) <= 0.03;                    // a 3% error is a fault, not a ratio
+  if (enough && fits && real && sane) {
+    learnSuggestX100 = lround(stepsPerRevX100 * (1.0 + learnB));
+    learnConfident = true;
+  }
+}
+
+// Adopt a steps/turn figure while nail `atFeeder` is known to be in front of
+// the feeder, keeping the numbering consistent across the change.
+void learnApplySpr(long newX100, uint16_t atFeeder) {
+  if (learnBaseSprX100 == 0) learnBaseSprX100 = stepsPerRevX100;
+  stepsPerRevX100 = newX100;
+  currentStep = normalizeStep(currentStep);
+  targetStep = currentStep;
+  nailOffsetSteps = normalizeStep(currentStep - nailBaseStep(atFeeder));
+  learnReset();          // later points belong to the new figure
+  saveConfig();
+  saveState();
+}
+
+void startVerify(uint16_t nail, bool doFeed) {
+  long delta = nailToStep(nail) - currentStep;
+  while (delta >  stepsPerRev() / 2) delta -= stepsPerRev();
+  while (delta < -stepsPerRev() / 2) delta += stepsPerRev();
+  if (delta != 0) verifyDir = delta > 0 ? 1 : -1;
+  verifyNail = nail;
+  verifyDoFeed = doFeed;
+  verifyPending = true;
+  // Stop ON the nail, not at the wrap's overshoot position, so the question
+  // "is this the right nail?" is about the nail actually at the feeder.
+  beginMoveToStep(nailToStep(nail));
+}
+
+// Carry on from a checkpoint with the wrap or feed it paused before.
+void finishVerify() {
+  verifyPending = false;
+  if (verifyDoFeed && wrapMode) {
+    startWrap(verifyNail, verifyDir);   // hand the loop off the chord, not the fix
+  } else {
+    beginMoveToStep(nailToStep(verifyNail));
+    armFeedAfterMove(verifyDoFeed);
+  }
+}
+
+// Answer to a checkpoint. v = the nail actually in front of the feeder;
+// -1 = "yes, it's right"; -2 = skip this one without learning from it.
+void verifyAnswer(long v) {
+  if (v == -2) {
+    learnNote = "Skipped checkpoint at nail " + String(verifyNail) + ".";
+    finishVerify();
+    return;
+  }
+
+  uint16_t seen = (v < 0) ? verifyNail : (uint16_t)(v % numNails);
+
+  // Always re-sync to where the disc is NOW. If you nudged it to centre the
+  // nail before answering "yes", that nudge is the correction, measured to the
+  // step. That precision is what lets it learn: a whole-nail answer alone can
+  // leave the disc up to half a nail off, and in simulation that kept ~10% of
+  // nails wrong where centring brought it to zero.
+  long was = nailOffsetSteps;
+  nailOffsetSteps = normalizeStep(currentStep - nailBaseStep(seen));
+  long c = nailOffsetSteps - was;
+  while (c >  stepsPerRev() / 2) c -= stepsPerRev();
+  while (c < -stepsPerRev() / 2) c += stepsPerRev();
+  learnCum += c;
+  if (c != 0) learnFixes++;
+  learnChecks++;
+
+  // record the point, keeping the most recent LEARN_MAX
+  if (learnN == LEARN_MAX) {
+    for (uint8_t i = 1; i < LEARN_MAX; i++) { learnX[i - 1] = learnX[i]; learnE[i - 1] = learnE[i]; }
+    learnN--;
+  }
+  learnX[learnN] = netSteps;
+  learnE[learnN] = learnCum;
+  learnN++;
+  learnFit();
+
+  if (seen == verifyNail && c == 0) {
+    learnNote = "Nail " + String(verifyNail) + " confirmed.";
+  } else if (seen == verifyNail) {
+    learnNote = "Nail " + String(verifyNail) + " centred -- corrected by " +
+                String(c) + " steps.";
+  } else {
+    learnNote = "Was nail " + String(seen) + ", not " + String(verifyNail) +
+                " -- re-synced by " + String(c) + " steps.";
+  }
+
+  if (learnConfident && learnAutoSpr && learnSuggestX100 != stepsPerRevX100) {
+    long before = stepsPerRevX100;
+    learnApplySpr(learnSuggestX100, seen);
+    learnNote += " Learned steps/turn: " + String(before / 100.0, 2) +
+                 " -> " + String(stepsPerRevX100 / 100.0, 2) + ".";
+  }
+  saveConfig();
+  saveState();
+  finishVerify();
+}
+
 // Single entry point for advancing to a nail. In wrap mode the whole cycle is
 // handed to the sequencer; otherwise it falls back to the old move-then-pulse.
 void presentNail(uint16_t nail, bool doFeed) {
+  if (verifyEvery > 0 && ++sinceVerify >= verifyEvery) {
+    sinceVerify = 0;
+    startVerify(nail, doFeed);
+    return;
+  }
   if (doFeed && wrapMode) {
     startWrap(nail);
   } else {
@@ -755,6 +959,18 @@ long discOffsetFromNail() {
   while (d >  stepsPerRev() / 2) d -= stepsPerRev();
   while (d < -stepsPerRev() / 2) d += stepsPerRev();
   return d;
+}
+
+// ---------------- Why auto isn't moving ----------------
+// Auto-run waits on several things. Every one of them must be visible on the
+// page, or a paused machine looks exactly like a broken Start button.
+String autoNote = "";            // why the last Start was refused
+String autoBlock() {
+  if (!autoRunning) return "";
+  if (homing) return "Paused: finding home.";
+  if (verifyPending && !stepping) return "Paused: waiting for your checkpoint answer.";
+  if (calRunning) return "Paused: calibration spin in progress.";
+  return "";
 }
 
 // ---------------- OLED dashboard ----------------
@@ -790,6 +1006,7 @@ void dashTick() {
     if (homing)                d.status = "HOMING";
     else if (calRunning)       d.status = "CALIBRATE";
     else if (homeError)      { d.status = "HOME FAIL"; d.alert = true; }
+    else if (verifyPending)  { d.status = "CONFIRM?"; d.alert = true; }
     else if (!positionKnown) { d.status = "CHECK POS"; d.alert = true; }
     else if (wrapBusy())       d.status = "WRAP";
     else if (feederBusy())     d.status = "FEED";
@@ -880,13 +1097,14 @@ void loadState() {
 void saveConfig() {
   File f = LittleFS.open(CONFIG_FILE, "w");
   if (!f) return;
-  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%ld\n%ld\n%u\n%u\n",
+  f.printf("%u\n%u\n%lu\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%d\n%u\n%u\n%u\n%u\n%u\n%ld\n%ld\n%u\n%u\n%u\n%u\n%ld\n",
            numNails, stepDelayMs, (unsigned long)autoAdvanceMs,
            feederRestAngle, feederFeedAngle, feederPulseMs, feederAutoFeed ? 1u : 0u,
            (int)dirSign, feederSettleMs, feederRecoverMs, autoHomeOnBoot ? 1u : 0u,
            wrapMode ? 1u : 0u, wrapSteps, (int)wrapDir,
            wrapSweep, wrapHoldInMs, wrapHoldSweepMs, servoSlewDeg, servoSlewMs,
-           stepsPerRevX100, nailOffsetSteps, rehomeEvery, oledFlip ? 1u : 0u);
+           stepsPerRevX100, nailOffsetSteps, rehomeEvery, oledFlip ? 1u : 0u,
+           verifyEvery, learnAutoSpr ? 1u : 0u, learnBaseSprX100);
   f.close();
 }
 
@@ -929,6 +1147,9 @@ void loadConfig() {
   nailOffsetSteps = readConfigLine(f, nailOffsetSteps);
   rehomeEvery = (uint16_t)readConfigLine(f, rehomeEvery);
   oledFlip = readConfigLine(f, oledFlip ? 1 : 0) != 0;
+  verifyEvery = (uint16_t)readConfigLine(f, verifyEvery);
+  learnAutoSpr = readConfigLine(f, learnAutoSpr ? 1 : 0) != 0;
+  learnBaseSprX100 = readConfigLine(f, learnBaseSprX100);
   if (stepsPerRevX100 < 1000) stepsPerRevX100 = STEPS_PER_REV_X100_DEF;
   f.close();
   if (numNails == 0) numNails = DEF_NUM_NAILS;
@@ -1039,6 +1260,25 @@ void handleStatus() {
   json += "\"nailOffsetSteps\":" + String(nailOffsetSteps) + ",";
   json += "\"rehomeEvery\":" + String(rehomeEvery) + ",";
   json += "\"avgNailMs\":" + String(avgNailMs) + ",";
+  json += "\"moving\":" + String(stepping ? "true" : "false") + ",";
+  json += "\"autoNote\":\"" + autoNote + "\",";
+  json += "\"autoBlock\":\"" + autoBlock() + "\",";
+  json += "\"calAwaiting\":" + String((calRevs > 0 && !calRunning) ? "true" : "false") + ",";
+  json += "\"verifyEvery\":" + String(verifyEvery) + ",";
+  json += "\"verifyPending\":" + String(verifyPending ? "true" : "false") + ",";
+  json += "\"verifyNail\":" + String(verifyNail) + ",";
+  json += "\"learnAutoSpr\":" + String(learnAutoSpr ? "true" : "false") + ",";
+  json += "\"learnPoints\":" + String(learnN) + ",";
+  json += "\"learnChecks\":" + String(learnChecks) + ",";
+  json += "\"learnFixes\":" + String(learnFixes) + ",";
+  json += "\"learnOffset\":" + String(learnA, 2) + ",";
+  json += "\"learnDriftPpm\":" + String(learnB * 1e6, 0) + ",";
+  json += "\"learnRms\":" + String(learnRms, 2) + ",";
+  json += "\"learnSpanTurns\":" + String(learnSpanTurns, 2) + ",";
+  json += "\"learnSuggestX100\":" + String(learnSuggestX100) + ",";
+  json += "\"learnConfident\":" + String(learnConfident ? "true" : "false") + ",";
+  json += "\"learnBaseSprX100\":" + String(learnBaseSprX100) + ",";
+  json += "\"learnNote\":\"" + learnNote + "\",";
   json += "\"elapsedMs\":" + String(runElapsedMs) + ",";
   json += "\"calRunning\":" + String(calRunning ? "true" : "false") + ",";
   json += "\"hasLimitSwitch\":" + String(HAS_LIMIT_SWITCH ? "true" : "false") + ",";
@@ -1099,6 +1339,8 @@ void handleConfig() {
     stepsPerRevX100 = STEPS_PER_REV_X100_DEF;
     nailOffsetSteps = 0;
     rehomeEvery = 0;
+    verifyEvery = 0;       // stops future checkpoints; a question already on
+    learnAutoSpr = true;   // screen stays, so its nail still gets wrapped
     applyAutoWrapGeometry();
     saveConfig();
     if (!feederBusy() && !wrapBusy()) servoSnapTo(feederRestAngle);
@@ -1132,6 +1374,14 @@ void handleConfig() {
   if (server.hasArg("servoSlewDeg")) { servoSlewDeg = (uint8_t)server.arg("servoSlewDeg").toInt(); if (servoSlewDeg < 1) servoSlewDeg = 1; }
   if (server.hasArg("servoSlewMs")) servoSlewMs = (uint16_t)server.arg("servoSlewMs").toInt();
   if (server.hasArg("rehomeEvery")) rehomeEvery = (uint16_t)server.arg("rehomeEvery").toInt();
+  if (server.hasArg("verifyEvery")) {
+    verifyEvery = (uint16_t)server.arg("verifyEvery").toInt();
+    sinceVerify = 0;
+    // Turning it off mid-question must still wrap the nail the run stopped on;
+    // just dropping the question would skip that chord entirely.
+    if (verifyEvery == 0 && verifyPending) finishVerify();
+  }
+  if (server.hasArg("learnAutoSpr")) learnAutoSpr = server.arg("learnAutoSpr").toInt() != 0;
   if (server.hasArg("oledFlip")) {
     oledFlip = server.arg("oledFlip").toInt() != 0;
     oled::setFlip(oledFlip);
@@ -1149,8 +1399,9 @@ void handleAction() {
   if (homing && cmd != "findhome") {
     // Ignore everything else while a homing seek is in flight -- the UI
     // disables these buttons too, but guard here in case of a stale page.
-  } else if ((feederBusy() || wrapBusy()) &&
+  } else if ((feederBusy() || wrapBusy() || verifyPending) &&
              (cmd == "next" || cmd == "prev" || cmd == "goto" || cmd == "gotostep")) {
+    // a checkpoint is waiting for an answer, or a feed is mid-cycle
     // A feed is mid-cycle. Starting a move now would drag thread out of the
     // servo's grip; the caller can retry in a few hundred ms.
   } else if (cmd == "next") {
@@ -1177,6 +1428,8 @@ void handleAction() {
     runElapsedMs = 0;
     lastNailAt = 0;
     positionKnown = true;   // the operator has told us where zero is
+    verifyPending = false;
+    learnReset();
     saveState();
   } else if (cmd == "findhome") {
     abortWrap();
@@ -1193,6 +1446,8 @@ void handleAction() {
     startHoming(dir);
   } else if (cmd == "gotostep") {
     lastNailAt = 0;
+    verifyPending = false;
+    sinceVerify = 0;
     // Move to a position in the SEQUENCE and take progress with it, so the
     // wrap carries on from there. "goto" moves the disc without touching
     // progress.
@@ -1217,6 +1472,7 @@ void handleAction() {
     // this corrects where the disc is, not where you are in the sequence.
     long n = server.arg("value").toInt();
     nailOffsetSteps = normalizeStep(currentStep - nailBaseStep((uint16_t)n));
+    learnReset();           // a hand re-sync is a new reference
     saveConfig();
     saveState();
   } else if (cmd == "calmove") {
@@ -1268,6 +1524,26 @@ void handleAction() {
       if (a > 180) a = 180;
       servoGoTo((uint8_t)a);
     }
+  } else if (cmd == "verify") {
+    if (verifyPending && !stepping) verifyAnswer(server.arg("value").toInt());
+  } else if (cmd == "learnapply") {
+    // Use the suggested steps/turn now. Only while a checkpoint has just
+    // confirmed where the disc is, so the numbering can be kept consistent.
+    if (learnSuggestX100 > 0 && !stepping && !wrapBusy() && !sequence.empty()) {
+      long was = stepsPerRevX100;
+      learnApplySpr(learnSuggestX100, sequence[currentIndex]);
+      learnNote = "Applied steps/turn " + String(was / 100.0, 2) + " -> " +
+                  String(stepsPerRevX100 / 100.0, 2) + ".";
+    }
+  } else if (cmd == "learnforget") {
+    // Put steps/turn back to what it was before learning touched it. The
+    // offset corrections stay: they describe where the disc really is.
+    if (learnBaseSprX100 > 0 && !stepping && !wrapBusy() && !sequence.empty()) {
+      learnApplySpr(learnBaseSprX100, sequence[currentIndex]);
+      learnBaseSprX100 = 0;
+    }
+    learnReset();
+    learnNote = "Forgot what it learned.";
   } else if (cmd == "wraptest") {
     // One wrap cycle on the nail currently at the feeder, for tuning the
     // overshoot and servo angles without committing to a run.
@@ -1280,9 +1556,22 @@ void handleAction() {
     long nail = server.arg("value").toInt();
     beginMoveToStep(nailToStep((uint16_t)nail));
   } else if (cmd == "start") {
-    autoRunning = true;
-    lastAutoAdvanceAt = millis();
+    // Refuse, with a reason, rather than switching auto on to do nothing --
+    // which is indistinguishable from a broken button.
+    if (sequence.empty()) {
+      autoNote = "Load a sequence first.";
+    } else if (currentIndex + 1 >= (int)sequence.size()) {
+      autoNote = "The sequence is finished. Use Go to step # to start again.";
+    } else {
+      autoRunning = true;
+      autoNote = "";
+      // First move now, not after a full dwell. Unsigned arithmetic makes this
+      // safe even straight after boot, when millis() is smaller than the dwell.
+      lastAutoAdvanceAt = millis() - autoAdvanceMs;
+    }
   } else if (cmd == "stop") {
+    autoNote = "";
+    if (calRunning) { calRemaining = 0; calRunning = false; calRevs = 0; }  // Stop means stop
     abortWrap();
     lastNailAt = 0;   // don't fold the pause into the per-nail average
     autoRunning = false;
@@ -1395,6 +1684,8 @@ void loop() {
         targetStep = 0;
         stepping = false;
         positionKnown = true;   // the switch is an absolute reference
+        verifyPending = false;
+        learnReset();
         homing = false;
         if (resumeAfterHome) {
           // Boot-time recovery: the switch has given us a known zero, so drive
@@ -1426,6 +1717,7 @@ void loop() {
     if (stepping && millis() - lastStepAt >= stepDelayMs) {
       lastStepAt = millis();
       currentStep += stepDir;
+      netSteps += stepDir;
       halfStepIdx = (uint8_t)(((halfStepIdx + (stepDir > 0 ? 1 : -1)) + 8) % 8);
       writeCoils(halfStepIdx);
       if (currentStep == targetStep) {
@@ -1449,6 +1741,7 @@ void loop() {
     // Optional hands-free auto-advance. Waits for the feeder as well as the
     // stepper, so the disc never starts turning with thread still being fed.
     if (autoRunning && !stepping && !feederBusy() && !wrapBusy() && !calRunning &&
+        !verifyPending &&
         !sequence.empty() &&
         currentIndex + 1 < (int)sequence.size() &&
         millis() - lastAutoAdvanceAt >= autoAdvanceMs) {
@@ -1483,7 +1776,12 @@ void loop() {
     long chunk = calRemaining > stepsPerRev() / 2 ? stepsPerRev() / 2 : calRemaining;
     calRemaining -= chunk;
     beginMoveToStep(normalizeStep(currentStep + chunk * dirSign));
-  }
+  }  // Spin finished. Drop the flag now: it only exists to keep auto-run and the
+  // servo out of the way WHILE the disc turns. Leaving it set until you press
+  // Correct locked auto-run solid, invisibly, for anyone who spun the disc to
+  // look and moved on. calRevs keeps the report open for as long as you like.
+  if (calRunning && !stepping && calRemaining == 0) calRunning = false;
+
 
   // Wrap sequencer: interleaves disc moves and servo swings
   serviceWrap();

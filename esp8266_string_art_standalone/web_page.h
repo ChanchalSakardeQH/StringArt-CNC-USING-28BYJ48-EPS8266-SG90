@@ -52,10 +52,10 @@
 const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
 <!DOCTYPE html>
 <!--
-  ESP8266 String Art CNC. Copyright (C) 2026 YOUR NAME.
+  ESP8266 String Art CNC. Copyright (C) 2026 CHANCHAL SAKARDE.
   SPDX-License-Identifier: GPL-3.0-or-later AND MIT
   Free software under the GNU GPL v3 or later; ABSOLUTELY NO WARRANTY.
-  Source: https://github.com/OWNER/REPO
+  Source: https://github.com/ChanchalSakardeQH/StringArt-CNC-USING-28BYJ48-EPS8266-SG90
   Bundles Cropper.js 1.6.1 (MIT, Chen Fengyuan) -- banner kept below.
 -->
 <html lang="en">
@@ -783,17 +783,16 @@ const char INDEX_HTML[] PROGMEM = R"STRINGARTPAGE(
     <!-- GPLv3 section 5(d): an interactive interface must show the legal notices. -->
     <footer class="legal">
       <b>ESP8266 String Art CNC</b><br>
-      Copyright &copy; 2026 YOUR NAME.<br>
+      Copyright &copy; 2026 CHANCHAL SAKARDE<br>
       Free software under the
       <a href="https://www.gnu.org/licenses/gpl-3.0.html" target="_blank" rel="noopener">GNU GPL v3 or later</a>.
       It comes with <b>absolutely no warranty</b>. You may share and change it
       under those terms.<br>
       Source code:
-      <a href="https://github.com/OWNER/REPO" target="_blank" rel="noopener">github.com/OWNER/REPO</a><br>
+      <a href="https://github.com/ChanchalSakardeQH/StringArt-CNC-USING-28BYJ48-EPS8266-SG90" target="_blank" rel="noopener">https://github.com/ChanchalSakardeQH/StringArt-CNC-USING-28BYJ48-EPS8266-SG90</a><br>
       <span class="legal-dim">
         Includes Cropper.js by Chen Fengyuan (MIT), the 5&times;7 font from
-        Adafruit-GFX by Adafruit Industries (BSD), and a base template designer
-        adapted from StringArt-CircleBase-Design by Chanchal Sakarde.
+        Adafruit-GFX by Adafruit Industries (BSD), and Remaining design and coding by Chanchal Sakarde.
       </span>
     </footer>
   </div>
